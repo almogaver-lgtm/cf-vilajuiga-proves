@@ -1,0 +1,540 @@
+import {API_URL,APP_VERSION,TEAM_NAME,ENVIRONMENT,BUILD_COMMIT} from './config.mjs';
+import {playerCard,POSITIONS,sortedPlayers} from './player-cards.mjs';
+import {mediaBatches} from './media-batches.mjs';
+import {LEAGUE,CLUBS,clubFor,clubMapsUrl} from './league.mjs';
+import {apiPost,requestId,prepareUpload,galleryUploadConfig,jpegBlob} from './api-client.mjs';
+import {createPortraitEditor} from './portrait-editor.mjs';
+import {esc,sortedMatches,nextMatch,lastMatch,opponent,result,dateLabel,mapsUrl,filterMatches,icsForMatch,usableSession} from './domain.mjs';
+const $=id=>document.getElementById(id);
+const root=$('app'),modal=$('modal');
+const PREFIX='cfv:v3:'+new URL('.',import.meta.url).pathname+':';
+const SESSION_KEY=PREFIX+'session';
+const DEVICE_KEY=PREFIX+'remembered-device-v1';
+const PLAYER_EDIT_NOTICE_KEY='cfv:preferences:'+new URL('.',import.meta.url).pathname+':player-edit-notice-v1';
+const storedValue=k=>{try{return localStorage.getItem(k);}catch{return null;}};
+const parseStored=value=>{try{return value===null?null:JSON.parse(value);}catch{return null;}};
+const read=k=>parseStored(storedValue(k));
+const write=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v));return true;}catch{return false;}};
+function remove(k){try{localStorage.removeItem(k);}catch{}}
+function clearStored(keepDevice=false){try{Object.keys(localStorage).filter(k=>k.startsWith(PREFIX)&&(!keepDevice||k!==DEVICE_KEY)).forEach(k=>localStorage.removeItem(k));}catch{}}
+const validDevice=value=>value&&typeof value.device_id==='string'&&/^[0-9a-f-]{36}$/i.test(value.device_id)&&typeof value.credential_secret==='string'&&/^[A-Za-z0-9_-]{43,128}$/.test(value.credential_secret)?value:null;
+function createDeviceCredential(){const bytes=crypto.getRandomValues(new Uint8Array(32)),secret=btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');return {device_id:crypto.randomUUID(),credential_secret:secret,registration_request_id:crypto.randomUUID(),registered:false};}
+const canResumeDevice=device=>validDevice(device)?.registered===true;
+function rememberedDevice(){return validDevice(read(DEVICE_KEY));}
+function getOrCreateDevice(){const current=rememberedDevice();if(current)return current;const candidate=createDeviceCredential();if(!write(DEVICE_KEY,candidate))return null;return rememberedDevice();}
+const stored=read(SESSION_KEY);
+let sessionGeneration=0,authAttemptGeneration=0,playerPortraitGeneration=0,deviceGeneration=0,resumeRetryTimer=null;
+const state={session:usableSession(stored)?stored:null,device:rememberedDevice(),data:null,view:'home',filter:'all',verified:false,loading:false,error:'',loginBusy:false,linkLogin:false,
+  privacy:null,authUser:null,galleryMatch:'',gallery:[],galleryNext:null,galleryLoading:false,galleryCacheIds:new Set(),includeHidden:false,thumbs:new Map(),images:new Set(),
+  queue:null,uploading:false,installEvent:null,modalMatch:null,editMode:'result',viewerPhoto:null,viewerUrl:null,viewGeneration:0,portraits:new Map(),portraitsVerified:false,portraitLoads:new Set(),playerDraft:null,playerPreviewUrl:null,playerPortraitEditor:null,playerPortraitPrepared:null,playerPortraitBackup:null,playerPortraitName:'',
+  users:[],usersLoading:false,inviteMessage:'',userDraft:null,pendingUserAction:null,playerEditNoticeDismissed:false,publicFeatures:{device_linking:false}};
+if(!state.session)clearStored(true);else state.data=read(PREFIX+'data:'+state.session.cacheKey)?.data||null;
+const paths={home:'<path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"/>',calendar:'<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 11h18m-13 4h2m4 0h2m-8 3h2"/>',photos:'<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8" cy="8" r="1.5"/><path d="m21 15-5-5L6 21"/>',team:'<circle cx="9" cy="7" r="3"/><path d="M3 21v-3a6 6 0 0 1 12 0v3m2-17a3 3 0 0 1 0 6m1 4a5 5 0 0 1 3 5v2"/>',arrow:'<path d="M5 12h14m-6-6 6 6-6 6"/>',chevron:'<path d="m9 5 7 7-7 7"/>',map:'<path d="M20 10c0 6-8 12-8 12S4 16 4 10a8 8 0 1 1 16 0z"/><circle cx="12" cy="10" r="2.5"/>',clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',lock:'<rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2"/>',close:'<path d="m6 6 12 12M6 18 18 6"/>',refresh:'<path d="M20 7v5h-5M4 17v-5h5m-4.7-2a8 8 0 0 1 13.2-6L20 7M4 17l2.5 3A8 8 0 0 0 19.7 14"/>',download:'<path d="M12 3v12m-5-5 5 5 5-5M4 15v6h16v-6"/>',upload:'<path d="M12 16V4m-5 5 5-5 5 5M4 16v5h16v-5"/>',edit:'<path d="m16 3 5 5-12 12-6 1 1-6zM13 6l5 5"/>',eye:'<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',trash:'<path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15m-9 3v8m4-8v8"/>',logout:'<path d="M9 4H4v16h5m3-8h9m-4-4 4 4-4 4"/>',info:'<circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10h.01"/>',ball:'<circle cx="12" cy="12" r="9"/><path d="m12 7 4 3-2 5h-4l-2-5zm0 0V3m4 7 5-1m-7 6 3 5m-7-5-3 5m1-10L3 9"/>',check:'<path d="m5 12 4 4L19 6"/>',phone:'<rect x="6" y="2" width="12" height="20" rx="2"/><path d="M10 18h4"/>'};
+const icon=name=>`<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${paths[name]||paths.info}</svg>`;
+const badge=(text,type='')=>`<span class="badge ${esc(type)}">${esc(text)}</span>`;
+const actionBtn=(action,label,kind='btn',data='')=>`<button type="button" class="${kind}" data-action="${action}" ${data}>${label}</button>`;
+const previewBanner=()=>ENVIRONMENT==='preview'?`<div class="preview-banner" role="status"><strong>VERSIÓ DE PROVES</strong><span>${esc(APP_VERSION)} · ${esc(BUILD_COMMIT||'commit local')}</span><small>Accés recordat i connexió entre mòbil i PC</small></div>`:'';
+const canEdit=()=>['editor','admin'].includes(state.data?.user?.rol);
+const isAdmin=()=>state.data?.user?.rol==='admin';
+const canEditPlayers=()=>!!state.data?.features?.player_cards&&(isAdmin()||!!state.data?.features?.family_player_edit);
+const canEditPlayer=id=>canEditPlayers()&&(id?!!state.data?.jugadors?.some(player=>player.jugador_id===id):isAdmin());
+const canEditFamilies=()=>isAdmin()&&state.data?.features?.family_user_edit===true;
+const canStoreFamilyChildren=()=>isAdmin()&&state.data?.features?.family_children===true;
+const canWrite=()=>state.verified&&navigator.onLine&&!state.uploading;
+function userFormCapabilityIssue(form,data=state.data){
+ if(form?.dataset.original&&data?.features?.family_user_edit!==true)return 'La capacitat d’editar famílies ja no està disponible. No s’ha enviat cap canvi; conserva o copia les dades abans de tancar.';
+ if(form?.querySelector('[name=fills]')&&data?.features?.family_children!==true)return 'La capacitat per desar els fills ja no està disponible. No s’ha enviat cap canvi i les dades introduïdes es conserven en aquest formulari.';
+ return '';
+}
+function revalidateUserFormCapabilities(form,data=state.data){
+ if(!form)return false;const issue=userFormCapabilityIssue(form,data),error=form.querySelector('#user-error'),button=form.querySelector('[type=submit]');
+ if(issue){form.dataset.capabilityBlocked='true';if(error){error.hidden=false;error.textContent=issue;}if(button)button.disabled=true;return false;}
+ if(form.dataset.capabilityBlocked){delete form.dataset.capabilityBlocked;if(error){error.hidden=true;error.textContent='';}if(button)button.disabled=!canWrite();}
+ return true;
+}
+const playerEditNoticeEligible=()=>state.verified&&state.data?.features?.family_player_edit===true&&['familia','editor'].includes(state.data?.user?.rol);
+const showPlayerEditNotice=()=>playerEditNoticeEligible()&&state.view!=='team'&&!state.playerEditNoticeDismissed&&read(PLAYER_EDIT_NOTICE_KEY)!==true;
+function markPlayerEditNoticeSeen(){state.playerEditNoticeDismissed=true;write(PLAYER_EDIT_NOTICE_KEY,true);}
+function playerEditNotice(){return `<aside class="player-edit-notice" role="status"><strong>✨ Ja pots editar els cromos!</strong><p>Entra a Equip i personalitza la foto, el nom i el dorsal.</p><div class="player-edit-notice-actions">${actionBtn('open-player-cards','Veure els cromos','btn small')}${actionBtn('dismiss-player-edit-notice','Entesos','text-btn')}</div></aside>`;}
+const user=()=>state.data?.user||state.authUser||{};
+const team=()=>state.data?.config?.equip_nom||TEAM_NAME;
+const matches=()=>state.data?.partits||[];
+const initials=name=>String(name||'?').split(' ').map(s=>s[0]).slice(0,2).join('').toUpperCase();
+function toast(text){$('toast').textContent=text;$('toast').hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('toast').hidden=true,6500);}
+function releaseImage(url){if(!url)return;URL.revokeObjectURL(url);state.images.delete(url);}
+function forgetThumb(id){releaseImage(state.thumbs.get(id));state.thumbs.delete(id);}
+function forgetImages(){state.viewGeneration++;state.images.forEach(url=>URL.revokeObjectURL(url));state.images.clear();state.thumbs.clear();state.galleryCacheIds.clear();state.portraits.clear();state.portraitsVerified=false;state.portraitLoads.clear();state.viewerUrl=null;}
+function imageUrl(base64){const url=URL.createObjectURL(jpegBlob(base64));state.images.add(url);return url;}
+function disposePlayerPortrait(){playerPortraitGeneration++;const editors=new Set([state.playerPortraitEditor,state.playerPortraitBackup?.editor]);editors.forEach(editor=>editor?.destroy());state.playerPortraitEditor=null;state.playerPortraitPrepared=null;state.playerPortraitBackup=null;state.playerPortraitName='';if(state.playerPreviewUrl){releaseImage(state.playerPreviewUrl);state.playerPreviewUrl=null;}}
+function resetSessionState(){sessionGeneration++;disposePlayerPortrait();forgetImages();Object.assign(state,{session:null,data:null,authUser:null,privacy:null,verified:false,loading:false,loginBusy:false,linkLogin:false,queue:null,uploading:false,gallery:[],galleryNext:null,galleryMatch:'',galleryLoading:false,galleryCacheIds:new Set(),includeHidden:false,modalMatch:null,editMode:'result',viewerPhoto:null,viewerUrl:null,pendingEdit:null,pendingDownload:null,pendingDelete:null,privacyRequest:null,view:'home',filter:'all',playerDraft:null,playerPreviewUrl:null,portraitsVerified:false,users:[],usersLoading:false,inviteMessage:'',userDraft:null,pendingUserAction:null});if(modal.open)modal.close();modal.replaceChildren();}
+function clearLocal(forgetDevice=true){if(forgetDevice)deviceGeneration++;clearStored(!forgetDevice);if(forgetDevice)state.device=null;resetSessionState();}
+function clearTechnicalSession(){clearLocal(false);state.device=rememberedDevice();}
+function staleSessionError(){return Object.assign(new Error('La sessió ha canviat en una altra pestanya.'),{code:'STALE_SESSION'});}
+const sessionIdentity=()=>({cacheKey:state.session?.cacheKey||null,generation:sessionGeneration});
+const isCurrentSession=identity=>!!identity.cacheKey&&state.session?.cacheKey===identity.cacheKey&&sessionGeneration===identity.generation;
+function beginAuthAttempt(){const sharedSession=storedValue(SESSION_KEY);return {id:++authAttemptGeneration,generation:sessionGeneration,cacheKey:state.session?.cacheKey||null,sharedSession,allowMissing:!!state.privacy&&sharedSession===null,adopted:null};}
+function sharedSessionMatches(identity,expectedShared,allowMissing=false){const raw=storedValue(SESSION_KEY),shared=parseStored(raw);return isCurrentSession(identity)&&((usableSession(shared)&&shared.cacheKey===identity.cacheKey)||(allowMissing&&raw===null&&expectedShared===null));}
+function sharedSessionUsesToken(identity,token){const shared=read(SESSION_KEY);return isCurrentSession(identity)&&usableSession(shared)&&shared.cacheKey===identity.cacheKey&&shared.token===token;}
+function isCurrentAuthAttempt(attempt){if(attempt.id!==authAttemptGeneration)return false;const identity=attempt.adopted||{cacheKey:attempt.cacheKey,generation:attempt.generation};if(!identity.cacheKey)return sessionGeneration===attempt.generation&&!state.session&&storedValue(SESSION_KEY)===attempt.sharedSession;return sharedSessionMatches(identity,attempt.sharedSession,attempt.allowMissing);}
+function discardStaleSharedSession(identity){if(!isCurrentSession(identity))return;if(state.session?.cacheKey)remove(PREFIX+'data:'+state.session.cacheKey);resetSessionState();state.error='La sessió ha canviat en una altra pestanya. Torna a entrar.';render();}
+async function api(payload){
+ const session=state.session,identity=sessionIdentity(),sharedSession=storedValue(SESSION_KEY),allowMissing=!!state.privacy&&sharedSession===null;if(!session)throw Object.assign(new Error('Cal iniciar sessió.'),{code:'UNAUTHORIZED'});if(!sharedSessionMatches(identity,sharedSession,allowMissing))throw staleSessionError();
+ try{const data=await apiPost(API_URL,{...payload,token:session.token,user_agent:navigator.userAgent});if(!isCurrentSession(identity))throw staleSessionError();if(!sharedSessionMatches(identity,sharedSession,allowMissing)){discardStaleSharedSession(identity);throw staleSessionError();}return data;}
+ catch(e){if(e.code==='UNAUTHORIZED'&&sharedSessionUsesToken(identity,session.token)&&state.session?.token===session.token){const resumable=canResumeDevice(state.device);if(resumable)clearTechnicalSession();else clearLocal(true);state.error=resumable?'Renovant l’accés recordat…':'La sessió ha caducat o s’ha revocat. Torna a entrar.';render();}throw e;}
+}
+function persistSession(identity=sessionIdentity(),expectedShared=storedValue(SESSION_KEY),allowMissing=false){if(!sharedSessionMatches(identity,expectedShared,allowMissing))return false;const serialized=JSON.stringify(state.session);if(!write(SESSION_KEY,state.session))return false;return storedValue(SESSION_KEY)===serialized;}
+function render(){
+ if(!state.session||state.privacy)return renderLogin();
+ if(!state.data)return renderLoading();
+ const online=state.verified&&navigator.onLine;
+ const labels={home:'Inici',calendar:'Partits',photos:'Galeria',team:'Equip',league:'Lliga',families:'Famílies'};
+ root.innerHTML=`${previewBanner()}<div class="shell"><aside class="sidebar"><div class="brand-line"><img src="./assets/crest.jpg" alt="Escut CF Vilajuïga"><div class="brand-title">CF VILAJUÏGA<small>La nostra temporada</small></div></div><p class="nav-label">Temporada ${esc(state.data.config?.temporada||'2026/27')}</p><nav aria-label="Navegació principal">${nav()}</nav><div class="sidebar-bottom"><div class="sidebar-message"><strong>Cada partit,<br>una història.</strong>Les petites grans coses que ens fan equip.</div>${actionBtn('install',icon('phone')+' Instal·lar l’app','btn')}${actionBtn('account',icon('lock')+' Espai de les famílies','btn')}</div></aside>
+ <div class="shell-content"><header class="topbar"><div class="top-title"><strong>La nostra temporada</strong><span> / ${labels[state.view]}</span></div><div class="mobile-logo"><img src="./assets/crest.jpg" alt=""><span>CF VILAJUÏGA<small>La nostra temporada</small></span></div><div class="top-actions"><span class="connection-label ${online?'':'offline'}"><span class="dot"></span>${online?'Dades actualitzades':state.loading?'Connectant…':'Sense dades noves'}</span>${actionBtn('refresh',icon('refresh'),'icon-btn',`aria-label="Actualitzar les dades" ${state.loading?'disabled':''}`)}<button type="button" class="account-btn" data-action="account" aria-label="El teu compte"><div class="avatar">${esc(initials(user().nom))}</div><span>${esc(user().nom)}</span></button></div></header>
+ ${!online?`<div class="offline-banner" role="status">${state.loading?'Comprovant les últimes dades…':'Sense connexió amb el servidor. Mostrant les últimes dades disponibles; les edicions i les fotos necessiten connexió.'}</div>`:''}
+ <main class="content" id="main">${state.error?`<div class="error-panel" role="alert">${esc(state.error)}</div>`:''}${state.view==='home'?home():state.view==='calendar'?calendar():state.view==='photos'?gallery():state.view==='league'?leagueView():state.view==='families'?familiesView():teamView()}</main>
+ <nav class="mobile-nav ${isAdmin()?'admin-nav':''}" aria-label="Navegació mòbil">${nav()}</nav></div></div>`;
+ if(state.view==='photos')paintThumbs();
+ if(state.view==='team'){paintPortraits();loadPortraits().catch(()=>{});}
+}
+function nav(){const items=[['home','Inici','home'],['calendar','Partits','calendar'],['photos','Galeria','photos'],['team','Equip','team'],['league','Lliga','ball']];if(isAdmin())items.push(['families','Famílies','team']);return items.map(([view,label,ico])=>`<div class="nav-item"><button type="button" class="nav-btn ${state.view===view?'active':''}" data-action="navigate" data-view="${view}" ${state.view===view?'aria-current="page"':''}>${icon(ico)}<span>${label}</span></button>${view==='team'&&showPlayerEditNotice()?playerEditNotice():''}</div>`).join('');}
+function renderLogin(){
+ const privacy=state.privacy;
+ root.innerHTML=`${previewBanner()}<main class="login"><section class="login-poster" aria-label="La nostra temporada"><div class="poster-top"><div class="brand-line"><img src="./assets/crest.jpg" alt="Escut CF Vilajuïga"><div class="brand-title">CF VILAJUÏGA<small>La nostra temporada</small></div></div><span class="season-chip">2026 / 27</span></div><div class="poster-content"><p class="eyebrow">Futbol, família i poble</p><h1>Més que<br>un partit.<br><em>Som equip.</em></h1></div><div class="poster-bottom"><span>El lloc on guardar tot allò que passa dins i fora del camp.</span><span class="eyebrow">Vilajuïga · Alt Empordà</span></div></section>
+ <section class="login-pane"><div class="login-form-wrap"><p class="eyebrow">Benvinguts a casa</p><h2>${privacy?'La privacitat<br>també fa equip.':'El nostre petit<br>gran equip.'}</h2><p class="login-lead">${privacy?'Abans d’entrar, compartim un compromís.':'Partits, resultats i records de la temporada, en un sol lloc per a les famílies.'}</p>
+ ${privacy?`<form id="privacy-form"><div class="privacy-panel">${icon('lock')}<p>${esc(privacy.text)}</p><label class="check-line"><input type="checkbox" name="accepted" required> He llegit i accepto el compromís de privacitat.</label></div><button type="submit" class="btn full" ${state.loginBusy?'disabled':''}>${state.loginBusy?'Guardant…':'Entrar a la temporada '+icon('arrow')}</button></form>`:
+ state.linkLogin&&state.publicFeatures.device_linking?`<form class="login-form" id="device-link-form"><div class="form-field"><label for="link-phone">El teu telèfon</label><div class="phone-wrap"><span>ES · +34</span><input class="input" id="link-phone" name="telefon" type="tel" inputmode="tel" autocomplete="tel" placeholder="600 000 000" required maxlength="40"></div></div><div class="form-field"><label for="device-link-code">Codi de l’altre dispositiu</label><input id="device-link-code" class="input invite-code-input" name="codi" type="text" inputmode="numeric" pattern="[0-9]{8}" autocomplete="one-time-code" minlength="8" maxlength="8" placeholder="00000000" required><p class="hint">Genera’l des d’«El teu espai» al mòbil. Caduca al cap de 10 minuts.</p></div><button type="submit" class="btn full" ${state.loginBusy?'disabled':''}>${state.loginBusy?'Connectant…':'Connectar aquest dispositiu '+icon('arrow')}</button>${actionBtn('use-invite','Tornar a la invitació','text-btn login-alternative')}</form>`:
+ `<form class="login-form" id="login-form"><div class="form-field"><label for="login-phone">El teu telèfon</label><div class="phone-wrap"><span>ES · +34</span><input class="input" id="login-phone" name="telefon" type="tel" inputmode="tel" autocomplete="tel" placeholder="600 000 000" required maxlength="40"></div><p class="hint">Fes servir el número autoritzat per l’equip.</p></div><div class="form-field"><label for="login-code">Codi d’invitació</label><input id="login-code" class="input invite-code-input" name="codi" type="text" inputmode="numeric" pattern="[0-9]{4}" autocomplete="one-time-code" minlength="4" maxlength="4" placeholder="0000" required><p class="hint">Només cal per activar l’accés inicial. Aquest navegador et recordarà fins que tanquis sessió.</p></div><button type="submit" class="btn full" ${state.loginBusy?'disabled':''}>${state.loginBusy?'Entrant…':'Entrar a l’app '+icon('arrow')}</button>${state.publicFeatures.device_linking?actionBtn('use-device-link','Ja tinc accés en un altre dispositiu','text-btn login-alternative'):''}</form>`}
+ ${state.error?`<p class="error-msg" role="alert">${esc(state.error)}</p>`:''}<div class="login-note">${icon('lock')}<span>Un espai privat per a les famílies. Les fotografies es comparteixen dins del grup i amb respecte a tothom.</span></div><div class="login-footer">${actionBtn('about','Sobre l’app','text-btn')}${actionBtn('install','Afegir al mòbil','text-btn')}</div></div></section></main>`;
+}
+function renderLoading(){root.innerHTML=`<main class="initial-loader"><img src="./assets/crest.jpg" alt="CF Vilajuïga" width="76" height="84"><p>Preparant la temporada.</p><span class="spinner"></span>${state.error?`<p class="error-msg">${esc(state.error)}</p>${actionBtn('refresh','Tornar-ho a provar','btn')}${actionBtn('logout','Tornar al login','text-btn')}`:''}</main>`;}
+function heading(eyebrow,title,description='',extra=''){return `<div class="page-heading"><div><p class="eyebrow">${esc(eyebrow)}</p><h1>${esc(title)}</h1>${description?`<p>${esc(description)}</p>`:''}</div>${extra}</div>`;}
+function home(){
+ const next=nextMatch(matches()),last=lastMatch(matches()),s=state.data.estadistiques||{PJ:0,V:0,E:0,D:0,GF:0,GC:0,DG:0};
+ const hero=next?`<div class="hero-kicker">El proper partit ${badge('Jornada '+next.jornada)} ${badge(next.local===team()?'A casa':'A fora')}</div><h2 class="hero-title">CF Vilajuïga<em>vs. ${esc(opponent(next,team()))}</em></h2><div class="hero-meta"><span>${icon('calendar')}${esc(dateLabel(next.data))}</span><span>${icon('clock')}${esc(next.hora||'Hora pendent')}</span></div>${actionBtn('match','Tot el partit '+icon('arrow'),'btn light',`data-id="${esc(next.partit_id)}"`)}`:
+ `<div class="hero-kicker">Temporada ${esc(state.data.config?.temporada||'2026/27')}<span class="live-pill">Som Vilajuïga</span></div><h2 class="hero-title">Tot comença<br><em>aquí.</em></h2><p class="hero-copy">Una nova temporada per jugar, créixer i compartir.</p>${actionBtn('navigate','Veure els partits '+icon('arrow'),'btn light','data-view="calendar"')}`;
+ const forms=sortedMatches(matches()).filter(m=>m.estat==='jugat').slice(-5).map(m=>{const r=result(m,team());return r?`<span class="form-result ${r.type}" title="${esc(r.label)}">${r.type==='win'?'V':r.type==='draw'?'E':'D'}</span>`:''}).join('');
+ return `${heading('L’espai de les famílies','La nostra temporada',`Hola, ${user().nom||'família'}. Ens veiem al camp.`)}<section class="hero"><div class="hero-content">${hero}</div><div class="hero-photo" role="img" aria-label="Pilota de futbol al camp, al capvespre"><span class="photo-tag">La nostra<br>passió</span></div></section>
+ <div class="dash-grid"><section class="card"><div class="section-title"><h2>La temporada en números</h2><span class="eyebrow muted">${esc(state.data.config?.temporada||'2026/27')}</span></div><div class="stats">${[['PJ','Partits',''],['V','Victòries','win'],['E','Empats','draw'],['D','Derrotes','loss']].map(([k,label,type])=>`<div class="stat ${type}"><span class="number">${s[k]??0}</span><small>${label}</small></div>`).join('')}</div><div class="secondary-stats"><span>Gols a favor <b>${s.GF??0}</b></span><span>Gols en contra <b>${s.GC??0}</b></span><span>Diferència <b>${s.DG>0?'+':''}${s.DG??0}</b></span></div>${forms?`<div class="form-strip">${forms}<small>Últims partits</small></div>`:`<p class="empty-small">Els números s’ompliran amb els primers resultats.</p>`}</section>
+ <section class="card"><div class="section-title"><h2>A peu de camp</h2></div><div class="quick-actions">${quick('navigate','calendar','Tots els partits','Dates, camps i resultats','calendar')}${quick('navigate','photos','Els nostres records','La galeria de la temporada','photos')}${quick('navigate','league','La nostra lliga','Els equips i els seus camps','ball')}</div></section>
+ <section class="card"><div class="section-title"><h2>L’últim resultat</h2>${last?actionBtn('match','Veure partit →','text-btn',`data-id="${esc(last.partit_id)}"`):''}</div>${last?`<div class="result-card"><div><p>${esc(opponent(last,team()))}</p><small>${esc(dateLabel(last.data))} · Jornada ${last.jornada}</small>${badge(result(last,team())?.label||'Jugat',result(last,team())?.type)}</div><div class="score">${last.gols_local} <span class="muted">:</span> ${last.gols_visitant}</div></div>`:`<div class="empty-small">Encara no hi ha cap resultat.<br>Quan es jugui el primer partit, el trobaràs aquí.</div>`}</section>
+ <section class="card"><div class="section-title"><h2>Records que fan equip</h2>${actionBtn('navigate','Obrir galeria →','text-btn','data-view="photos"')}</div><p class="empty-small">Les celebracions, els nervis, les rialles.<br>Compartim les fotos amb les famílies de l’equip.</p></section></div><footer class="season-footer"><span>${icon('lock')}Un espai privat. Un equip compartit.</span><span>CF Vilajuïga · ${esc(state.data.config?.temporada||'2026/27')}</span></footer>`;
+}
+function quick(action,view,title,subtitle,ico){return `<button type="button" class="quick-action" data-action="${action}" data-view="${view}"><span class="action-icon">${icon(ico)}</span><span><strong>${title}</strong><small>${subtitle}</small></span>${icon('chevron')}</button>`;}
+function empty(title,text,ico='calendar',button=''){return `<div class="empty-state"><div class="empty-icon">${icon(ico)}</div><h2>${esc(title)}</h2><p>${esc(text)}</p>${button}</div>`;}
+function calendar(){
+ const list=filterMatches(matches(),state.filter);let month='';
+ return `${heading('De jornada en jornada','Ens veiem al camp','Tot el calendari de la temporada, sempre a mà.')}<div class="tabs" role="group" aria-label="Filtrar partits">${[['all','Tots'],['upcoming','Per jugar'],['played','Resultats']].map(([f,l])=>actionBtn('filter',l,'tab '+(state.filter===f?'active':''),`data-filter="${f}" aria-pressed="${state.filter===f}"`)).join('')}</div>${!list.length?empty(matches().length?'Sense partits en aquest filtre':'La temporada ens espera',matches().length?'Prova un altre filtre per veure la resta de jornades.':'Afegirem el calendari quan el tinguem. Aquí hi trobaràs dates, hores i com arribar a cada camp.'):`<div class="match-list">${list.map(m=>{const key=String(m.data).slice(0,7),newMonth=key!==month;month=key;return `${newMonth?`<h2 class="month-heading">${esc(dateLabel(m.data,'month'))}</h2>`:''}${matchRow(m)}`;}).join('')}</div>`}`;
+}
+function matchRow(m){
+ const r=result(m,team());const d=dateLabel(m.data,'short').replace('.','').split(' '),status=m.estat==='jugat'?r?.label||'Jugat':m.estat==='ajornat'?'Ajornat':m.estat==='cancel·lat'?'Cancel·lat':'Per jugar';
+ return `<button type="button" class="match-row" data-action="match" data-id="${esc(m.partit_id)}"><span class="match-date"><b>${esc(d[0])}</b>${esc(d.slice(1).join(' '))}</span><div><div class="match-teams">${esc(m.local)}<span class="vs">vs.</span>${esc(m.visitant)}</div><div class="match-info"><span>Jornada ${esc(m.jornada)} · ${esc(dateLabel(m.data,'weekday'))}</span><span class="camp-info">${icon('map')}${esc(m.camp_nom||'Camp pendent')}</span></div></div><span class="match-status">${m.estat==='jugat'?`<span class="match-score">${esc(m.gols_local)} : ${esc(m.gols_visitant)}</span>`:`<span class="match-time">${esc(m.hora||'—')}</span>`}${badge(status,r?.type||'')}</span>${icon('chevron')}</button>`;
+}
+function gallery(){
+ if(!matches().length)return heading('Els nostres records','Instants de temporada','El que passa al camp, ho guardem en família.')+empty('Els records encara han de venir','Quan afegim el calendari, podreu compartir les fotografies de cada partit.','photos');
+ if(!state.galleryMatch)state.galleryMatch=(lastMatch(matches())||nextMatch(matches())||sortedMatches(matches())[0]).partit_id;
+ const selected=matches().find(m=>m.partit_id===state.galleryMatch);
+ return `${heading('Els nostres records','Instants de temporada','Les fotos són d’ús privat, dins del grup de famílies.')}<div class="gallery-toolbar"><label class="sr-only" for="gallery-match">Tria un partit</label><select class="input" id="gallery-match">${sortedMatches(matches()).map(m=>`<option value="${esc(m.partit_id)}" ${m.partit_id===state.galleryMatch?'selected':''}>J${m.jornada} · ${dateLabel(m.data,'short')} · ${esc(opponent(m,team()))}</option>`).join('')}</select>${actionBtn('upload',icon('upload')+' Compartir fotos','btn',canWrite()?'':'disabled')}</div>${isAdmin()?`<label class="toggle-line"><input type="checkbox" id="hidden-photos" ${state.includeHidden?'checked':''}> Incloure fotos ocultes · administració</label>`:''}
+ ${state.galleryLoading&&!state.gallery.length?`<div class="empty-state"><span class="spinner"></span><p>Buscant els records d’aquest partit…</p></div>`:state.gallery.length?`<div class="photo-grid">${state.gallery.map(f=>`<article class="photo-card ${f.bloquejada?'blocked':''}"><button type="button" class="photo-open" data-action="photo" data-id="${esc(f.foto_id)}" aria-label="Obrir fotografia ${esc(f.peu||'del partit')}"><span class="spinner" data-photo-spinner="${esc(f.foto_id)}"></span><img data-thumb="${esc(f.foto_id)}" alt="${esc(f.peu||'Fotografia del partit')}" hidden></button><div class="photo-meta"><p>${esc(f.peu||'Un instant de partit')}</p><small>${esc(f.pujat_per_nom)} · ${esc(dateLabel(String(f.pujat_at).slice(0,10),'short'))}</small>${f.bloquejada?badge('Oculta','loss'):''}</div></article>`).join('')}</div>${state.galleryNext?`<div class="load-more">${actionBtn('more-photos',state.galleryLoading?'Carregant…':'Veure més records','btn ghost',state.galleryLoading?'disabled':'')}</div>`:''}`:
+ empty('Aquest partit encara no té fotos',state.verified?'La primera foto pot ser la teva. Comparteix els records del partit amb la resta de famílies.':'Necessites connexió per consultar la galeria. Les fotos no es guarden offline.','photos',state.verified?actionBtn('upload','Compartir les primeres fotos','btn',canWrite()?'':'disabled'):'')}
+ <div class="info-callout">${icon('lock')}<p>No comparteixis les fotografies fora del grup sense autorització. Si una imatge no s’ha de mostrar, avisa l’administrador.</p></div>`;
+}
+function leagueFixture(club){
+ const list=sortedMatches(matches()).filter(m=>String(m.partit_id).startsWith('2026_27_f1_')&&(clubFor(m.local)?.id===club.id||clubFor(m.visitant)?.id===club.id));
+ return nextMatch(list)||lastMatch(list)||list[0];
+}
+function clubMark(club){return club.own?'<img class="club-crest" src="./assets/crest.jpg" alt="Escut CF Vilajuïga">':`<span class="club-monogram" aria-hidden="true">${esc(club.short)}</span>`;}
+function fixtureLink(m){return actionBtn('match',`<span><small>El nostre partit · J${esc(m.jornada)} · ${m.local===team()?'A casa':'A fora'}</small><strong>${esc(dateLabel(m.data))} · ${esc(m.hora||'Hora pendent')}</strong></span>${icon('chevron')}`,'club-fixture',`data-id="${esc(m.partit_id)}"`);}
+function leagueView(){
+ return `${heading('Futbol de l’Alt Empordà','La nostra lliga','Els equips amb qui compartirem la temporada.')}<section class="league-banner"><div><p class="eyebrow">${esc(LEAGUE.season)} · ${esc(LEAGUE.phase)}</p><h2>${esc(LEAGUE.name)}</h2><p>${esc(LEAGUE.organizer)}</p><span>${esc(LEAGUE.format)}</span></div><div class="league-count"><b>8</b><span>equips<br>una mateixa passió</span></div></section><div class="league-grid">${CLUBS.map(club=>{const m=leagueFixture(club);return `<article class="club-card ${club.own?'our-club':''}" data-club="${esc(club.id)}"><div class="club-heading">${clubMark(club)}<div><p>${esc(club.town)}</p><h2>${esc(club.name)}</h2>${club.own?badge('Som nosaltres','win'):''}</div></div><div class="club-field">${icon('map')}<div><h3>${esc(club.field)}</h3><p>${esc(club.address)}</p></div></div><div class="club-actions">${actionBtn('club','Coneix l’equip','btn secondary small',`data-id="${esc(club.id)}"`)}<a class="btn ghost small" href="${esc(clubMapsUrl(club))}" target="_blank" rel="noopener noreferrer" aria-label="Com arribar al camp de ${esc(club.name)}">${icon('map')} Com arribar-hi</a></div>${m?fixtureLink(m):''}</article>`;}).join('')}</div><div class="league-footnote"><p>${icon('info')} Dates i rivals segons el calendari facilitat. A les fitxes trobaràs les fonts de cada camp i les precisions d’accés disponibles.</p><p>Informació consultada el ${esc(dateLabel(LEAGUE.checked,'short'))} de 2026.</p></div>`;
+}
+function clubDetails(id){
+ const club=CLUBS.find(c=>c.id===id);if(!club)return;const m=leagueFixture(club);
+ openModal(club.name,`<div class="club-profile"><div class="club-heading">${clubMark(club)}<div><p>${esc(club.town)} · Alt Empordà</p><h3>${esc(club.name)}</h3>${club.own?badge('El nostre equip','win'):badge(LEAGUE.phase)}</div></div><p class="club-description">${esc(club.description)}</p><div class="club-field">${icon('map')}<div><h3>${esc(club.field)}</h3><p>${esc(club.address)}</p></div></div>${club.note?`<p class="venue-note">${esc(club.note)}</p>`:''}<a class="btn" href="${esc(clubMapsUrl(club))}" target="_blank" rel="noopener noreferrer">${icon('map')} Com arribar al seu camp</a>${m?fixtureLink(m):''}<div class="club-sources"><h3>Fonts de la informació</h3><ul>${club.sources.map(source=>`<li><a href="${esc(source.url)}" target="_blank" rel="noopener noreferrer">${esc(source.label)} ${icon('arrow')}</a></li>`).join('')}</ul><p>Calendari: Aleví masculí · Fase 1 · Grup 1 · Anada.<br>Consulta de les ubicacions: 6 d’octubre de 2026.</p></div></div>`);
+}
+function teamView(){
+ const players=sortedPlayers(state.data.jugadors||[]),enabled=state.data.features?.player_cards;
+ const add=isAdmin()&&enabled?actionBtn('add-player',icon('team')+' Afegir jugador','btn',canWrite()?'':'disabled'):'';
+ return `${heading('La nostra col·lecció','Els cromos de l’equip','Cada jugador, una part de la nostra història.',add)}<div class="album-heading"><div>${icon('ball')}<span>CF Vilajuïga · ${esc(state.data.config?.temporada||'2026/27')}</span></div><span>${players.length} ${players.length===1?'cromo':'cromos'} · Aleví</span></div>${players.length?`<div class="album-grid">${players.map(j=>`<div class="album-slot"><button class="card-open" type="button" data-action="player" data-id="${esc(j.jugador_id)}" aria-label="Obrir el cromo de ${esc(j.nom)}">${playerCard(j,{season:state.data.config?.temporada})}</button>${canEditPlayer(j.jugador_id)?actionBtn('edit-player',icon('edit')+' Editar cromo','card-edit',`data-id="${esc(j.jugador_id)}" ${canWrite()?'':'disabled'}`):''}</div>`).join('')}</div>`:`<section class="album-empty"><div class="album-example">${playerCard({nom:'El teu nom',dorsal:'10',posicio:'Migcampista'},{preview:true,season:state.data.config?.temporada})}<small>Mostra del disseny · Dades d’exemple</small></div><div class="album-invitation"><p class="eyebrow">L’àlbum comença aquí</p><h2>Petits jugadors.<br>Grans protagonistes.</h2><p>El nom, el dorsal, la posició i el retrat. La nostra col·lecció, feta amb les persones que fan equip.</p>${add||'<p class="hint">Els cromos s’ompliran quan afegim els jugadors.</p>'}</div></section>`}${canEditPlayers()?'<p class="venue-note">Els cromos són compartits. Revisa els canvis abans de guardar.</p>':''}<div class="info-callout">${icon('lock')}<p>Els retrats es comparteixen només amb les famílies. Les restriccions de fotografies de cada jugador també s’apliquen als cromos.</p></div>`;
+}
+function invitationDate(value){const date=new Date(value);return Number.isFinite(date.getTime())?new Intl.DateTimeFormat('ca-ES',{dateStyle:'medium',timeStyle:'short',timeZone:'Europe/Madrid'}).format(date):'data pendent';}
+function familiesView(){
+ const roles={familia:'Família',editor:'Editor',admin:'Administrador'};
+ const content=state.usersLoading&&!state.users.length?`<div class="empty-state"><span class="spinner"></span><p>Carregant les famílies…</p></div>`:state.users.length?`<div class="family-list">${state.users.map(u=>{
+  const pending=u.invitacio?.estat==='pendent'&&Date.parse(u.invitacio.caduca_at)>Date.now();
+  const status=!u.actiu?badge('Desactivada','loss'):pending?badge('Invitació pendent','draw'):u.privacitat_acceptada?badge('Activa','win'):badge('Sense accés');
+  return `<article class="family-card"><div class="family-main"><div class="avatar">${esc(initials(u.nom))}</div><div><h2>${esc(u.nom)}</h2><p>${esc(u.telefon)} · ${esc(roles[u.rol]||u.rol)}</p>${u.fills?`<p class="family-children">Jugadors: ${esc(u.fills)}</p>`:''}<div class="family-status">${status}${pending?`<small>Caduca ${esc(invitationDate(u.invitacio.caduca_at))}</small>`:''}</div></div></div><div class="family-actions">${canEditFamilies()?actionBtn('edit-user','Editar','btn ghost small',`data-id="${esc(u.telefon)}" ${canWrite()?'':'disabled'}`):''}${actionBtn('invite-user','Convidar','btn small',`data-id="${esc(u.telefon)}" ${u.actiu&&canWrite()?'':'disabled'}`)}${actionBtn('revoke-user','Tancar sessions','btn ghost small',`data-id="${esc(u.telefon)}" ${u.actiu&&canWrite()?'':'disabled'}`)}${actionBtn('toggle-user',u.actiu?'Desactivar':'Reactivar','btn ghost small',`data-id="${esc(u.telefon)}" ${canWrite()?'':'disabled'}`)}</div></article>`;
+ }).join('')}</div>`:empty('Encara no hi ha famílies','Afegeix la primera família i envia-li una invitació privada.','team');
+ return `${heading('Administració privada','Famílies','Gestiona l’accés sense compartir codis permanents.',actionBtn('add-user',icon('team')+' Afegir família','btn',canWrite()?'':'disabled'))}${content}<div class="info-callout">${icon('lock')}<p>Cada invitació crea un codi de quatre xifres, d’un sol ús i amb caducitat. El codi només es mostra una vegada.</p></div>`;
+}
+async function loadUsers(){
+ if(!isAdmin()||!state.verified||!navigator.onLine||state.usersLoading)return;state.usersLoading=true;render();
+ try{const r=await api({action:'listUsers'});state.users=r.usuaris||[];}catch(e){if(e.code!=='UNAUTHORIZED')toast(e.message);}
+ finally{state.usersLoading=false;render();}
+}
+function userEditor(phone){
+ if(!isAdmin()||!canWrite())return;const original=phone?state.users.find(u=>u.telefon===phone):null;if(phone&&!original)return;
+ if(original&&!canEditFamilies())return;
+ if(state.userDraft&&state.userDraft.original!==(original?.telefon||'')){toast('Acaba de reintentar el canvi de família pendent abans d’editar-ne una altra.');return;}
+ const pending=state.userDraft?.payload,values=pending||original||{nom:'',telefon:'',fills:'',rol:'familia',actiu:true},locked=!!state.userDraft;
+ openModal(original?'Editar família':'Afegir família',`<form id="user-form" data-original="${esc(original?.telefon||'')}" data-version="${esc(original?.version||'')}"><div class="form-field"><label for="user-name">Nom de l’adult</label><input class="input" id="user-name" name="nom" maxlength="80" value="${esc(values.nom||'')}" required ${locked?'readonly':''}></div><div class="form-field"><label for="user-phone">Telèfon</label><input class="input" id="user-phone" name="telefon" type="tel" inputmode="tel" autocomplete="tel" placeholder="+34 600 000 000" maxlength="40" value="${esc(values.telefon||'')}" required ${locked?'readonly':''}></div>${canStoreFamilyChildren()?`<div class="form-field"><label for="user-children">Jugadors vinculats (opcional)</label><textarea class="input" id="user-children" name="fills" maxlength="150" rows="2" ${locked?'readonly':''}>${esc(values.fills||'')}</textarea><p class="hint">Nom de pila o indicació breu. Màxim 150 caràcters.</p></div>`:''}<div class="form-field"><label for="user-role">Rol</label><select class="input" id="user-role" name="rol" ${locked?'disabled':''}>${[['familia','Família'],['editor','Editor'],['admin','Administrador']].map(([value,label])=>`<option value="${value}" ${values.rol===value?'selected':''}>${label}</option>`).join('')}</select></div>${original?.es_actual?'<p class="venue-note">Si canvies el teu telèfon, es tancarà aquesta sessió i necessitaràs una invitació nova.</p>':''}<p id="user-error" class="error-msg" role="alert" hidden></p><button type="submit" class="btn full">${locked?'Reintentar el mateix canvi':original?'Guardar canvis':'Guardar família'}</button></form>`);
+}
+async function saveUser(form){
+ if(!isAdmin()||!canWrite()||!revalidateUserFormCapabilities(form))return;const values=new FormData(form),button=form.querySelector('[type=submit]'),original=form.dataset.original||'',current=original?state.users.find(u=>u.telefon===original):null;
+ const draft={action:original?'updateUser':'saveUser',telefon:String(values.get('telefon')||'').trim(),nom:String(values.get('nom')||'').trim(),rol:values.get('rol')||(state.userDraft?.payload.rol),actiu:current?.actiu??true};
+ if(form.querySelector('[name=fills]')&&canStoreFamilyChildren())draft.fills=String(values.get('fills')||'').trim();
+ if(original){draft.original_telefon=original;draft.expected_version=form.dataset.version;}
+ const signature=JSON.stringify(draft),existing=state.userDraft,error=$('user-error');
+ if(existing&&existing.signature!==signature){error.hidden=false;error.textContent='Hi ha un canvi pendent. Reintenta els mateixos valors abans de modificar-los.';return;}
+ if(original&&current?.es_actual&&draft.telefon!==original&&!existing&&!window.confirm('Canviar el teu telèfon tancarà aquesta sessió i requerirà una invitació nova. Vols continuar?'))return;
+ button.disabled=true;button.textContent=existing?'Reintentant…':'Guardant…';
+ try{const transaction=existing||{original,signature,payload:{...draft,request_id:requestId()}};state.userDraft=transaction;const r=await api(transaction.payload);state.userDraft=null;if(r.self_phone_changed){clearLocal();state.error='El telèfon s’ha actualitzat. Demana a un altre administrador una invitació nova.';render();return;}if(r.usuari?.es_actual&&!r.usuari.actiu){clearLocal();state.error='El teu accés s’ha desactivat. Necessitaràs una invitació nova per tornar a entrar.';render();return;}modal.close();if(r.usuari?.es_actual){await refresh(false);if(isAdmin()&&state.view==='families')await loadUsers();}else await loadUsers();toast(r.phone_changed?'Telèfon actualitzat. Cal enviar una invitació nova.':original?'Família actualitzada.':'Família guardada. Ja la pots convidar.');}
+ catch(e){if(!['OUTCOME_UNKNOWN','INTERNAL_ERROR','BUSY'].includes(e.code)&&e.name!=='TypeError')state.userDraft=null;if(error){error.hidden=false;error.textContent=e.message+(e.code==='CONFLICT'?' Tanca i actualitza abans de tornar-ho a provar.':'');}if(button.isConnected){button.disabled=false;button.textContent=state.userDraft?'Reintentar el mateix canvi':original?'Guardar canvis':'Guardar família';}}
+}
+async function createInvite(phone){
+ if(!isAdmin()||!canWrite())return;
+ try{
+  const r=await api({action:'createInvite',telefon:phone}),url=new URL('.',location.href).href,expires=invitationDate(r.caduca_at);
+  state.inviteMessage=`Hola ${r.nom}! Aquí tens l’app de la temporada del CF Vilajuïga: ${url}\nObre-la, escriu el teu telèfon i aquest codi d’un sol ús: ${r.codi}\nCaduca el ${expires}. És només per a les famílies de l’equip: no comparteixis les fotos fora del grup.`;
+  const whatsapp='https://wa.me/'+r.telefon.replace(/\D/g,'')+'?text='+encodeURIComponent(state.inviteMessage);
+  openModal('Invitació preparada',`<div class="invite-result"><p class="eyebrow">Codi d’un sol ús</p><strong>${esc(r.codi)}</strong><p>Caduca el ${esc(expires)}.</p></div><div class="info-callout">${icon('lock')}<p>Aquest codi no es tornarà a mostrar. Si es perd, genera una invitació nova.</p></div>`,`<a class="btn" href="${esc(whatsapp)}" target="_blank" rel="noopener noreferrer">Enviar per WhatsApp</a>${actionBtn('copy-invite','Copiar missatge','btn ghost')}`);
+  await loadUsers();
+ }catch(e){toast(e.message);}
+}
+async function copyInvite(){
+ if(!state.inviteMessage)return;
+ try{await navigator.clipboard.writeText(state.inviteMessage);toast('Missatge copiat.');}
+ catch(_){toast('No s’ha pogut copiar. Selecciona el missatge des de WhatsApp.');}
+}
+function confirmUserAction(mode,phone){
+ const u=state.users.find(user=>user.telefon===phone);if(!u||!isAdmin()||!canWrite())return;
+ const revoke=mode==='revoke',title=revoke?'Tancar totes les sessions?':u.actiu?'Desactivar aquesta família?':'Reactivar aquesta família?';
+ const text=revoke?'Haurà d’entrar de nou amb una invitació. Els altres usuaris no quedaran afectats.':u.actiu?'Perdrà l’accés a la propera petició. La podràs reactivar més endavant.':'Recuperarà l’accés quan li enviïs una invitació nova.';
+ openModal(title,`<p>${esc(u.nom)}</p><p class="hint" style="margin-top:12px">${esc(text)}</p>`,actionBtn('close','Cancel·lar','btn ghost')+actionBtn('confirm-user',revoke?'Tancar sessions':u.actiu?'Desactivar':'Reactivar',revoke||u.actiu?'btn danger':'btn',`data-mode="${mode}" data-id="${esc(phone)}"`));
+}
+async function changeUser(mode,phone){
+ const u=state.users.find(user=>user.telefon===phone);if(!u||!isAdmin()||!canWrite())return;
+ try{if(mode==='revoke')await api({action:'revokeSessions',telefon:phone});else if(!canEditFamilies())await api({action:'saveUser',telefon:phone,nom:u.nom,rol:u.rol,actiu:!u.actiu});else{const pending=state.pendingUserAction;if(pending&&(pending.mode!==mode||pending.phone!==phone)){toast('Acaba de reintentar el canvi d’accés pendent.');return;}const transaction=pending||{mode,phone,payload:{action:'updateUser',original_telefon:phone,telefon:phone,nom:u.nom,fills:u.fills||'',rol:u.rol,actiu:!u.actiu,expected_version:u.version,request_id:requestId()}};state.pendingUserAction=transaction;await api(transaction.payload);state.pendingUserAction=null;}modal.close();await loadUsers();toast(mode==='revoke'?'Sessions tancades.':'Accés actualitzat.');}catch(e){if(!['OUTCOME_UNKNOWN','INTERNAL_ERROR','BUSY'].includes(e.code)&&e.name!=='TypeError')state.pendingUserAction=null;toast(e.message);}
+}
+const portraitKey=j=>j.jugador_id+':'+j.retrat_version;
+function paintPortraits(){
+  if(!state.portraitsVerified)return;
+ for(const j of state.data?.jugadors||[]){const key=portraitKey(j);if(!state.portraits.has(key))continue;const url=state.portraits.get(key);
+  document.querySelectorAll(`[data-player-card="${CSS.escape(j.jugador_id)}"]`).forEach(card=>{const image=card.querySelector('[data-portrait]'),fallback=card.querySelector('.card-silhouette');if(url&&image){image.src=url;image.hidden=false;if(fallback)fallback.hidden=true;}else if(fallback){const label=fallback.querySelector('small');if(label)label.textContent='Retrat no disponible';}});
+ }
+}
+async function loadPortraits(){
+  if(!state.data?.features?.player_cards||!state.portraitsVerified||!state.verified||!navigator.onLine)return;
+ const generation=state.viewGeneration,token=state.session?.token;
+ const list=(state.data.jugadors||[]).filter(j=>j.te_retrat&&!state.portraits.has(portraitKey(j))&&!state.portraitLoads.has(portraitKey(j)));
+ list.forEach(j=>state.portraitLoads.add(portraitKey(j)));
+ try{await mediaBatches(list,async chunk=>{
+  try{const r=await api({action:'getPlayerPortraits',jugador_ids:chunk.map(j=>j.jugador_id),include_hidden:isAdmin()});if(state.viewGeneration!==generation||state.session?.token!==token||!navigator.onLine)return false;
+   for(const j of chunk){const item=r.items.find(x=>x.jugador_id===j.jugador_id);state.portraits.set(portraitKey(j),item?.ok&&item.retrat_version===j.retrat_version?imageUrl(item.base64):null);state.portraitLoads.delete(portraitKey(j));}paintPortraits();
+  }catch(e){if(state.viewGeneration!==generation)return false;chunk.forEach(j=>{state.portraits.set(portraitKey(j),null);state.portraitLoads.delete(portraitKey(j));});paintPortraits();return false;}
+ },()=>state.viewGeneration===generation&&state.session?.token===token&&navigator.onLine);}
+ finally{if(state.viewGeneration===generation)list.forEach(j=>state.portraitLoads.delete(portraitKey(j)));}
+}
+function playerDetails(id){const j=state.data.jugadors?.find(j=>j.jugador_id===id);if(!j)return;openModal(j.nom,`<div class="player-card-detail">${playerCard(j,{large:true,season:state.data.config?.temporada})}</div>`,canEditPlayer(id)?actionBtn('edit-player',icon('edit')+' Editar cromo','btn',`data-id="${esc(id)}" ${canWrite()?'':'disabled'}`):'','player-dialog');paintPortraits();loadPortraits().catch(()=>{});}
+function playerEditor(id){
+ if(!canEditPlayer(id)||!canWrite())return;
+ if(state.playerDraft&&state.playerDraft.id!==id){toast('Acaba de guardar el cromo pendent abans d’editar-ne un altre.');return;}
+ disposePlayerPortrait();
+ const j=state.data.jugadors?.find(j=>j.jugador_id===id)||{nom:'',dorsal:'',posicio:'',actualitzat_at:''};
+ const pending=state.playerDraft?.payload,values=pending||j,locked=!!state.playerDraft;
+ openModal(id?'Editar cromo':'Nou cromo',`<form id="player-form" data-id="${esc(id||'')}" data-expected="${esc(pending?.expected_updated_at??j.actualitzat_at??'')}"><div class="form-field"><label for="player-name">Nom</label><input class="input" id="player-name" name="nom" maxlength="60" value="${esc(values.nom)}" placeholder="Nom del jugador" required><p class="hint">Nom de pila, sense cognoms.</p></div><div class="player-form-pair"><div class="form-field"><label for="player-jersey">Dorsal</label><input class="input" id="player-jersey" name="dorsal" type="number" min="0" max="99" step="1" value="${esc(values.dorsal??'')}"></div><div class="form-field"><label for="player-position">Posició</label><select class="input" id="player-position" name="posicio"><option value="">Per definir</option>${POSITIONS.map(p=>`<option ${p===values.posicio?'selected':''}>${p}</option>`).join('')}</select></div></div><div class="form-field portrait-field"><label for="player-portrait">Retrat ${j.te_retrat?'nou (opcional)':'(opcional)'}</label><input class="input" id="player-portrait" name="retrat" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,image/avif" ${locked?'disabled':''}><p class="hint">Tria una foto i ajusta-la aquí. L’original només es processa en memòria i no es desa al dispositiu.</p><div class="portrait-ready-row"><span id="portrait-status" class="hint" role="status">${locked&&pending?.photo_base64?'Retrat preparat per reintentar.':'Cap retrat nou preparat.'}</span>${actionBtn('edit-portrait','Tornar a editar','btn secondary small',`${locked||!pending?.photo_base64?'hidden':''}`)}</div></div><section id="portrait-editor" class="portrait-editor" aria-label="Editor del retrat" hidden><p class="portrait-instructions">Arrossega per enquadrar. Fes pinça o utilitza els controls per ampliar i girar.</p><div class="portrait-stage"><canvas id="portrait-canvas" width="532" height="600" aria-label="Retall del retrat"></canvas><span>Àrea visible al cromo</span></div><div class="portrait-sliders"><label class="portrait-zoom" for="portrait-zoom">Zoom <input id="portrait-zoom" type="range" min="1" max="3" step="0.01" value="1"></label><label class="portrait-rotation" for="portrait-rotation">Gir <output id="portrait-rotation-value" for="portrait-rotation">0.0°</output><input id="portrait-rotation" type="range" min="-180" max="180" step="0.1" value="0"></label></div><div class="portrait-tools">${actionBtn('rotate-portrait-left','↶ 90°','btn ghost small')}${actionBtn('rotate-portrait-right','↷ 90°','btn ghost small')}${actionBtn('reset-portrait','Restablir','btn ghost small')}</div><div class="portrait-editor-actions">${actionBtn('cancel-portrait','Cancel·lar','btn ghost')}${actionBtn('apply-portrait','Aplicar','btn')}</div></section><div class="player-live-preview" id="player-live-preview">${playerCard({...j,nom:values.nom||'El teu nom',dorsal:values.dorsal,posicio:values.posicio,te_retrat:false},{preview:true,season:state.data.config?.temporada})}</div>${j.no_mostrar?'<p class="venue-note">Aquest jugador té activada la restricció de fotografies. El cromo continuarà ocult per a les famílies.</p>':''}<p class="hint">Aquest cromo és compartit amb totes les famílies. Revisa les dades i el retrat abans de guardar.</p><p id="player-error" class="error-msg" role="alert" hidden></p>${actionBtn('reload-player','Actualitzar aquest cromo','btn secondary full',`data-id="${esc(id||'')}" hidden`)}<button type="submit" class="btn full">${locked?'Reintentar el mateix cromo':'Guardar cromo'}</button></form>`);paintPortraits();
+ const form=$('player-form');
+ if(pending?.photo_base64){state.playerPortraitPrepared={photo_base64:pending.photo_base64,foto_id:pending.foto_id};state.playerPortraitName='Retrat pendent';state.playerPreviewUrl=imageUrl(pending.photo_base64);updatePlayerPreview(form);}
+}
+function setPortraitStatus(text,error=false){const status=$('portrait-status');if(status){status.textContent=text;status.classList.toggle('error-msg',error);}}
+function attachPlayerPortraitPreview(form){
+ const frame=form.querySelector('#player-live-preview .card-photo'),silhouette=frame?.querySelector('.card-silhouette');if(!frame)return;
+ if(state.playerPortraitBackup&&state.playerPortraitEditor){const canvas=document.createElement('canvas');canvas.width=266;canvas.height=300;canvas.className='player-portrait player-portrait-preview';canvas.setAttribute('aria-label','Previsualització del retall al cromo');state.playerPortraitEditor.drawTo(canvas);if(silhouette)silhouette.hidden=true;frame.appendChild(canvas);return;}
+ if(state.playerPreviewUrl){const img=document.createElement('img');img.className='player-portrait';img.alt='Previsualització local del retrat';img.src=state.playerPreviewUrl;if(silhouette)silhouette.hidden=true;frame.appendChild(img);}
+}
+function updatePlayerPreview(form){const preview=form.querySelector('#player-live-preview');if(!preview||!state.data)return;const values=new FormData(form);preview.innerHTML=playerCard({nom:String(values.get('nom')||'El teu nom'),dorsal:values.get('dorsal'),posicio:values.get('posicio')},{preview:true,season:state.data.config?.temporada});attachPlayerPortraitPreview(form);}
+function togglePortraitEditor(form,visible){const panel=form.querySelector('#portrait-editor'),edit=form.querySelector('[data-action="edit-portrait"]'),input=form.elements.retrat;panel.hidden=!visible;modal.classList.toggle('portrait-editing',visible);if(input)input.disabled=visible||!!state.playerDraft;if(edit){edit.hidden=visible||!state.playerPortraitEditor||!!state.playerDraft;edit.disabled=false;}updatePlayerPreview(form);}
+function portraitBackup(){return {editor:state.playerPortraitEditor,transform:state.playerPortraitEditor?.getTransform(),prepared:state.playerPortraitPrepared,previewUrl:state.playerPreviewUrl,name:state.playerPortraitName};}
+function cancelPlayerPortrait(form,announce=true){
+ const backup=state.playerPortraitBackup;if(!backup)return;playerPortraitGeneration++;
+ if(state.playerPortraitEditor!==backup.editor)state.playerPortraitEditor?.destroy();else if(backup.transform)state.playerPortraitEditor?.setTransform(backup.transform);
+ state.playerPortraitEditor=backup.editor;state.playerPortraitPrepared=backup.prepared;state.playerPreviewUrl=backup.previewUrl;state.playerPortraitName=backup.name;state.playerPortraitBackup=null;form.elements.retrat.value='';togglePortraitEditor(form,false);setPortraitStatus(state.playerPortraitPrepared?`${state.playerPortraitName||'Retrat'} preparat.`:'Cap retrat nou preparat.');if(announce)toast('Canvis del retrat cancel·lats.');
+}
+async function selectPlayerPortrait(form,file){
+ if(!file||state.playerDraft)return;if(state.playerPortraitBackup)cancelPlayerPortrait(form,false);
+ const identity=sessionIdentity(),generation=++playerPortraitGeneration,backup=portraitBackup(),canvas=form.querySelector('#portrait-canvas'),zoomInput=form.querySelector('#portrait-zoom'),rotationInput=form.querySelector('#portrait-rotation'),rotationOutput=form.querySelector('#portrait-rotation-value'),input=form.elements.retrat,edit=form.querySelector('[data-action="edit-portrait"]');input.disabled=true;if(edit)edit.disabled=true;setPortraitStatus('Obrint la fotografia…');
+ let editor;
+ try{
+  editor=await createPortraitEditor(file,{canvas,zoomInput,rotationInput,rotationOutput,onChange:()=>{if(state.playerPortraitEditor===editor&&state.playerPortraitBackup)updatePlayerPreview(form);}});
+  if(generation!==playerPortraitGeneration||!isCurrentSession(identity)||!form.isConnected){editor.destroy();return;}
+  state.playerPortraitBackup=backup;state.playerPortraitEditor=editor;state.playerPortraitName=file.name;togglePortraitEditor(form,true);setPortraitStatus('Ajusta l’enquadrament i prem Aplicar.');
+ }catch(e){editor?.destroy();if(generation!==playerPortraitGeneration||!isCurrentSession(identity))return;form.elements.retrat.value='';setPortraitStatus(e.message,true);}
+ finally{if(generation===playerPortraitGeneration&&form.isConnected&&!state.playerPortraitBackup){input.disabled=!!state.playerDraft;if(edit)edit.disabled=false;}}
+}
+function editPlayerPortrait(form){if(!state.playerPortraitEditor||state.playerPortraitBackup||state.playerDraft)return;state.playerPortraitBackup=portraitBackup();togglePortraitEditor(form,true);setPortraitStatus('Ajusta l’enquadrament i prem Aplicar.');}
+async function applyPlayerPortrait(form){
+ const editor=state.playerPortraitEditor,backup=state.playerPortraitBackup,panel=form.querySelector('#portrait-editor');if(!editor||!backup)return;
+ const identity=sessionIdentity(),generation=++playerPortraitGeneration,buttons=[...panel.querySelectorAll('button')];buttons.forEach(button=>button.disabled=true);setPortraitStatus('Preparant el JPEG privat…');
+ try{
+  const config={...state.data.config,image_max_dimension:Math.min(Number(state.data.config.portrait_max_dimension)||1200,1200),upload_max_bytes:Math.min(Number(state.data.config.portrait_max_bytes)||409600,409600)};
+  const exported=await editor.exportJpeg({maxBytes:config.upload_max_bytes});if(generation!==playerPortraitGeneration||!isCurrentSession(identity)||state.playerPortraitEditor!==editor)return;
+  const prepared=await prepareUpload(exported.blob,{config});if(generation!==playerPortraitGeneration||!isCurrentSession(identity)||state.playerPortraitEditor!==editor)return;
+  if(backup.editor&&backup.editor!==editor)backup.editor.destroy();if(backup.previewUrl)releaseImage(backup.previewUrl);
+  state.playerPortraitPrepared={photo_base64:prepared.photo_base64,foto_id:prepared.foto_id};state.playerPreviewUrl=imageUrl(prepared.photo_base64);state.playerPortraitBackup=null;form.elements.retrat.value='';togglePortraitEditor(form,false);setPortraitStatus(`${state.playerPortraitName||'Retrat'} preparat.`);
+ }catch(e){if(generation===playerPortraitGeneration&&isCurrentSession(identity)&&state.playerPortraitEditor===editor)setPortraitStatus(e.message,true);}
+ finally{if(generation===playerPortraitGeneration&&panel.isConnected)buttons.forEach(button=>button.disabled=false);}
+}
+async function savePlayer(form){
+ if(!canEditPlayer(form.dataset.id||undefined)||!canWrite())return;const identity=sessionIdentity(),existing=state.playerDraft,values=new FormData(form),button=form.querySelector('[type=submit]');
+ const draft={action:'savePlayer',jugador_id:existing?.payload.jugador_id||form.dataset.id||requestId(),nom:String(values.get('nom')||'').trim(),dorsal:values.get('dorsal')===''?'':Number(values.get('dorsal')),posicio:values.get('posicio'),expected_updated_at:form.dataset.expected};
+ const signature=JSON.stringify(draft),prepared=state.playerPortraitPrepared,error=$('player-error');
+ if(state.playerPortraitBackup){error.hidden=false;error.textContent='Aplica o cancel·la l’enquadrament abans de guardar el cromo.';return;}
+ if(form.elements.retrat.files[0]&&!prepared){error.hidden=false;error.textContent='Espera que s’obri la fotografia i aplica l’enquadrament.';return;}
+ if(existing&&existing.signature!==signature){error.hidden=false;error.textContent='Hi ha un desament pendent. Reintenta els mateixos valors abans de canviar-los.';return;}
+ state.uploading=true;button.disabled=true;button.textContent='Guardant cromo…';modal.querySelector('[data-action=close]').disabled=true;
+ try{
+  let transaction=existing;
+  if(!transaction){const payload={...draft,request_id:requestId()};if(prepared){payload.photo_base64=prepared.photo_base64;payload.foto_id=prepared.foto_id;}if(!isCurrentSession(identity))return;transaction={id:form.dataset.id||undefined,signature,payload};state.playerDraft=transaction;}
+  if(!isCurrentSession(identity))return;await api(transaction.payload);if(!isCurrentSession(identity))return;state.playerDraft=null;state.uploading=false;modal.close();await refresh(false);if(isCurrentSession(identity))toast('Cromo guardat a l’àlbum.');
+ }catch(e){if(!isCurrentSession(identity))return;if(['VALIDATION','FORBIDDEN','CONFLICT','NOT_FOUND'].includes(e.code))state.playerDraft=null;if(error){error.hidden=false;error.textContent=e.message+(['CONFLICT','NOT_FOUND'].includes(e.code)?' Actualitza les dades abans de tornar a editar.':'');}const reload=form.querySelector('[data-action="reload-player"]');if(reload)reload.hidden=!['CONFLICT','NOT_FOUND'].includes(e.code);if(button.isConnected){button.textContent=state.playerDraft?'Reintentar el mateix cromo':'Guardar cromo';if(state.playerDraft){form.elements.retrat.value='';form.elements.retrat.disabled=true;const edit=form.querySelector('[data-action="edit-portrait"]');if(edit)edit.disabled=true;}}}
+ finally{if(isCurrentSession(identity)){state.uploading=false;if(button.isConnected){button.disabled=false;const close=modal.querySelector('[data-action=close]');if(close)close.disabled=false;}}}
+}
+
+function openModal(title,body,footer='',className=''){modal.className=className;modal.innerHTML=`<header class="dialog-header"><h2 id="modal-title">${esc(title)}</h2>${actionBtn('close',icon('close'),'icon-btn','aria-label="Tancar"')}</header><div class="dialog-body">${body}</div>${footer?`<footer class="dialog-footer">${footer}</footer>`:''}`;if(!modal.open)modal.showModal();}
+function matchDetails(id){
+ const m=matches().find(m=>m.partit_id===id);if(!m)return;state.modalMatch=id;
+ const host=clubFor(m.local),rival=clubFor(opponent(m,team()));
+ const url=host&&m.camp_nom===host.field&&m.camp_adreca===host.address?clubMapsUrl(host):mapsUrl(m),r=result(m,team());const teamBlock=name=>`<div class="detail-team">${name===team()?`<img src="./assets/crest.jpg" alt="">`:`<span class="opponent-icon">${icon('ball')}</span>`}${esc(name)}</div>`;
+ openModal('Jornada '+m.jornada,`<div class="detail-top"><p class="eyebrow">${esc(dateLabel(m.data))}</p><div class="detail-teams">${teamBlock(m.local)}<div class="detail-score">${m.estat==='jugat'?`${esc(m.gols_local)} : ${esc(m.gols_visitant)}`:'VS'}</div>${teamBlock(m.visitant)}</div><div style="margin-top:20px">${badge(r?.label||m.estat,r?.type||'')}</div></div>
+ <div class="detail-info"><div>${icon('clock')}<span><strong>${esc(m.hora||'Hora pendent de confirmar')}</strong><small>${esc(dateLabel(m.data))}</small></span></div><div>${icon('map')}<span><strong>${esc(m.camp_nom||'Camp pendent')}</strong><small>${esc(m.camp_adreca||'')}</small></span></div></div><div class="detail-actions">${url?`<a class="btn" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${icon('map')} Com arribar-hi</a>`:''}${m.hora?actionBtn('add-calendar',icon('calendar')+' Al calendari','btn secondary',`data-id="${esc(id)}"`):''}</div>
+ ${rival?`<div class="rival-link">${actionBtn('club',icon('ball')+' Coneix '+esc(rival.name),'btn ghost',`data-id="${esc(rival.id)}"`)}</div>`:''}${host?.note&&m.camp_nom===host.field?`<p class="venue-note">${esc(host.note)}</p>`:''}
+ <section class="chronicle"><h3>La crònica</h3><p>${m.cronica?esc(m.cronica):'<span class="muted">Encara no hi ha crònica. La història d’aquest partit està per escriure.</span>'}</p></section>`,`${canEdit()?actionBtn('edit-match',icon('edit')+' Editar partit','btn ghost',`data-id="${esc(id)}" ${canWrite()?'':'disabled'}`):''}${actionBtn('match-gallery',icon('photos')+' Fotos del partit','btn',`data-id="${esc(id)}"`)}`);
+}
+function editor(id,mode='result'){
+ if(!canEdit()||!canWrite())return;let m=matches().find(m=>m.partit_id===id);if(!m)return;const pending=state.pendingEdit?.payload;if(pending?.partit_id===id&&pending.action===(mode==='result'?'updateResult':'updateChronicle'))m={...m,...pending,actualitzat_at:pending.expected_updated_at};state.modalMatch=id;state.editMode=mode;
+ openModal('Editar jornada '+m.jornada,`<div class="edit-tabs">${actionBtn('edit-tab','Marcador','btn small '+(mode==='result'?'':'ghost'),'data-mode="result"')}${actionBtn('edit-tab','Crònica','btn small '+(mode==='chronicle'?'':'ghost'),'data-mode="chronicle"')}</div><form id="edit-form" data-id="${esc(id)}" data-expected="${esc(m.actualitzat_at||'')}">${mode==='result'?`<div class="form-field"><label for="match-status">Estat del partit</label><select id="match-status" name="estat" class="input">${[['pendent','Per jugar'],['jugat','Jugat'],['ajornat','Ajornat'],['cancel·lat','Cancel·lat']].map(([v,l])=>`<option value="${v}" ${m.estat===v?'selected':''}>${l}</option>`).join('')}</select></div><div class="score-form"><div class="form-field"><label for="gols-local">${esc(m.local)}</label><input id="gols-local" name="gols_local" class="input" type="number" min="0" max="99" step="1" value="${m.gols_local===''?'':esc(m.gols_local)}" ${m.estat==='jugat'?'required':'disabled'}></div><div class="form-field"><label for="gols-visitant">${esc(m.visitant)}</label><input id="gols-visitant" name="gols_visitant" class="input" type="number" min="0" max="99" step="1" value="${m.gols_visitant===''?'':esc(m.gols_visitant)}" ${m.estat==='jugat'?'required':'disabled'}></div></div>`:`<div class="form-field"><label for="match-chronicle">La història del partit</label><textarea id="match-chronicle" name="cronica" class="input" maxlength="${state.data.config?.cronica_max_chars||1500}" rows="7">${esc(m.cronica||'')}</textarea><p class="hint">Màxim ${state.data.config?.cronica_max_chars||1500} caràcters. Evita cognoms i dades personals dels nens.</p></div>`}<p class="error-msg" id="edit-error" role="alert" hidden></p><button type="submit" class="btn full" style="margin-top:25px">Guardar els canvis</button></form>`);
+}
+async function saveEdit(form){
+ if(!canEdit()||!canWrite())return;const values=new FormData(form),chronicle=state.editMode==='chronicle';
+ const original=state.pendingEdit;
+ const draft={action:chronicle?'updateChronicle':'updateResult',partit_id:form.dataset.id,expected_updated_at:form.dataset.expected,...(chronicle?{cronica:String(values.get('cronica'))}:{estat:values.get('estat'),gols_local:values.get('estat')==='jugat'?Number(values.get('gols_local')):null,gols_visitant:values.get('estat')==='jugat'?Number(values.get('gols_visitant')):null})};
+ const signature=JSON.stringify(draft);
+ if(original&&original.signature!==signature){$('edit-error').hidden=false;$('edit-error').textContent='Hi ha una petició pendent. Reintenta els mateixos valors abans de canviar-los.';return;}
+ const transaction=original||{signature,payload:{...draft,request_id:requestId()}};state.pendingEdit=transaction;
+ const btn=form.querySelector('button[type=submit]');btn.disabled=true;btn.textContent='Guardant…';
+ try{const r=await api(transaction.payload);const index=state.data.partits.findIndex(m=>m.partit_id===r.partit.partit_id);state.data.partits[index]=r.partit;state.pendingEdit=null;cacheData();await refresh(false);matchDetails(r.partit.partit_id);toast('Canvis guardats.');}
+ catch(e){if(!['OUTCOME_UNKNOWN','INTERNAL_ERROR','BUSY'].includes(e.code)&&e.name!=='TypeError')state.pendingEdit=null;const err=$('edit-error');if(err){err.hidden=false;err.textContent=e.message+(e.code==='CONFLICT'?' Tanca i actualitza abans d’editar.':'');}btn.disabled=false;btn.textContent='Reintentar el mateix canvi';}
+}
+function cacheData(){if(state.session&&state.data)write(PREFIX+'data:'+state.session.cacheKey,{savedAt:Date.now(),data:state.data});}
+function applyBootstrap(data,identity=sessionIdentity()){
+ if(!sharedSessionMatches(identity))return false;
+ if(data.renewed&&state.session){const previous=state.session;state.session={...state.session,token:data.renewed.token,expiresAt:data.renewed.expiresAt};if(!persistSession(identity)){state.session=previous;return false;}data={...data};delete data.renewed;}
+ // Reuse only portraits still authorized by a fresh server snapshot for the same role.
+ const keep=new Map(),sameRole=state.data?.user?.rol===data.user?.rol;
+  if(data.features?.fresh_permissions&&data.user?.privacyAccepted&&sameRole){
+  for(const j of data.jugadors||[]){const key=portraitKey(j),url=state.portraits.get(key);if(j.te_retrat&&url)keep.set(key,url);}
+ }
+ const playerForm=modal.querySelector('#player-form'),editedPlayerId=playerForm?.dataset.id,visiblePlayer=!editedPlayerId||(data.jugadors||[]).some(player=>player.jugador_id===editedPlayerId),mayEditPlayer=!!data.features?.player_cards&&(data.user?.rol==='admin'||data.features?.family_player_edit),keepPlayerEditor=!!playerForm&&data.user?.privacyAccepted&&data.features?.fresh_permissions&&mayEditPlayer&&visiblePlayer&&(!editedPlayerId?data.user?.rol==='admin':true);
+ const userForm=modal.querySelector('#user-form'),keepUserEditor=!!userForm&&data.user?.rol==='admin';
+ const keptUrls=new Set(keep.values());if(keepPlayerEditor&&state.playerPreviewUrl)keptUrls.add(state.playerPreviewUrl);state.viewGeneration++;
+ state.images.forEach(url=>{if(!keptUrls.has(url)){URL.revokeObjectURL(url);state.images.delete(url);}});
+  state.portraits=keep;state.portraitsVerified=!!(data.features?.fresh_permissions&&data.user?.privacyAccepted);state.portraitLoads.clear();state.thumbs.clear();state.galleryCacheIds.clear();state.gallery=[];state.galleryNext=null;
+ if(modal.open&&(state.viewerPhoto||modal.querySelector('.player-card-detail')||(playerForm&&!keepPlayerEditor)||(userForm&&!keepUserEditor)))modal.close();
+ if(data.user?.rol!=='admin'){state.users=[];if(state.view==='families')state.view='home';}
+ state.data=data;state.verified=true;if(userForm&&keepUserEditor)revalidateUserFormCapabilities(userForm,data);cacheData();return true;
+}
+async function refresh(show=true){
+ if(!state.session||state.privacy||state.loading)return;const identity=sessionIdentity(),sessionToken=state.session.token;state.loading=true;state.error='';if(show)render();
+ try{const data=await api({action:'bootstrap'});if(!isCurrentSession(identity)||state.session?.token!==sessionToken)return;if(!applyBootstrap(data,identity))return;await ensureRememberedDevice(data,identity);}
+ catch(e){if(e.code==='UNAUTHORIZED'){if(canResumeDevice(state.device))await resumeRemembered();return;}if(!isCurrentSession(identity)||state.session?.token!==sessionToken)return;state.verified=false;forgetImages();state.gallery=[];if(modal.open&&!state.uploading)modal.close();if(e.code==='PRIVACY_REQUIRED'){clearTechnicalSession();if(canResumeDevice(state.device))await resumeRemembered();else{state.error='El compromís de privacitat ha canviat. Cal actualitzar el backend abans de recuperar l’accés recordat.';render();}return;}state.error=state.data?'No s’han pogut obtenir dades noves. Pots consultar l’última versió guardada.':e.message;}
+ finally{if(isCurrentSession(identity)){state.loading=false;render();if(state.view==='photos'&&state.verified)await loadGallery(true);if(state.view==='team'&&state.verified)await loadPortraits();}}
+}
+async function ensureRememberedDevice(data,identity=sessionIdentity()){
+ if(data?.features?.remembered_devices!==true||!isCurrentSession(identity))return;
+ const device=getOrCreateDevice();if(!device)return;state.device=device;
+ const token=state.session.token,shared=storedValue(SESSION_KEY),request=device.registration_request_id||requestId();
+ if(!device.registration_request_id){device.registration_request_id=request;if(!write(DEVICE_KEY,device))return;}
+ try{const r=await api({action:'registerDevice',device_id:device.device_id,credential_secret:device.credential_secret,request_id:request});if(!isCurrentSession(identity)||state.session?.token!==token||!sharedSessionUsesToken(identity,token))return;const previous=state.session;state.session={...state.session,token:r.token,expiresAt:r.expiresAt};if(!persistSession(identity,shared)){state.session=previous;return;}const saved={device_id:device.device_id,credential_secret:device.credential_secret,registered:true};write(DEVICE_KEY,saved);state.device=saved;}
+ catch(e){if(e.code==='UNAUTHORIZED')return;}
+}
+async function adoptAccessResponse(r,attempt,device){
+ if(!isCurrentAuthAttempt(attempt))return false;clearTechnicalSession();if(device&&r.device_id===device.device_id)device={device_id:device.device_id,credential_secret:device.credential_secret,registered:true};state.device=device;if(device)write(DEVICE_KEY,device);attempt.sharedSession=storedValue(SESSION_KEY);state.authUser=r.user;state.session={token:r.token,expiresAt:r.expiresAt,cacheKey:device?'device:'+device.device_id:requestId()};attempt.adopted=sessionIdentity();attempt.allowMissing=true;
+ if(!r.user.privacyAccepted){state.privacy=r.privacy;return true;}
+ if(!persistSession(attempt.adopted,attempt.sharedSession,true)){resetSessionState();return false;}attempt.sharedSession=storedValue(SESSION_KEY);attempt.allowMissing=false;
+ if(r.bootstrap){if(!applyBootstrap(r.bootstrap,attempt.adopted)){resetSessionState();return false;}await ensureRememberedDevice(r.bootstrap,attempt.adopted);}else await refresh(false);return true;
+}
+async function loadPublicFeatures(){
+ try{const response=await fetch(API_URL+'?action=health',{cache:'no-store'}),body=await response.json(),features=body?.ok?body.data?.features:null;state.publicFeatures={device_linking:features?.device_linking===true};if(!state.publicFeatures.device_linking)state.linkLogin=false;}
+ catch{state.publicFeatures={device_linking:false};state.linkLogin=false;}
+ if(!state.session)render();
+}
+function retryRememberedDevice(raw,generation){
+ clearTimeout(resumeRetryTimer);resumeRetryTimer=setTimeout(()=>{if(generation===deviceGeneration&&storedValue(DEVICE_KEY)===raw&&!state.session)resumeRemembered();},1200);
+}
+async function resumeRemembered(){
+ const device=rememberedDevice();if(!validDevice(device)||!navigator.onLine||state.session||state.loginBusy)return false;const raw=storedValue(DEVICE_KEY),generation=deviceGeneration,attempt=beginAuthAttempt(),pending=device.registered!==true;state.device=device;state.loginBusy=true;state.error='';render();
+ try{const r=await apiPost(API_URL,{action:'resumeDevice',device_id:device.device_id,credential_secret:device.credential_secret,include_bootstrap:true,user_agent:navigator.userAgent});if(attempt.id!==authAttemptGeneration||generation!==deviceGeneration||storedValue(DEVICE_KEY)!==raw)return false;const shared=read(SESSION_KEY);if(usableSession(shared)){state.session=shared;await refresh(false);return true;}return await adoptAccessResponse(r,attempt,device);}
+ catch(e){if(attempt.id!==authAttemptGeneration||generation!==deviceGeneration||storedValue(DEVICE_KEY)!==raw)return false;if(e.code==='BUSY'){state.error='L’accés s’està actualitzant. Ho tornarem a provar automàticament.';retryRememberedDevice(raw,generation);}else if(e.code==='UNAUTHORIZED'){if(pending)state.error='';else{clearLocal(true);state.error='L’accés d’aquest dispositiu s’ha revocat. Connecta’l de nou des d’un altre dispositiu.';}}else if(e.code==='UNKNOWN_ACTION'&&pending)state.error='';else state.error='No s’ha pogut comprovar l’accés recordat. Torna-ho a provar quan tinguis connexió.';return false;}
+ finally{if(attempt.id===authAttemptGeneration){state.loginBusy=false;render();}}
+}
+async function recoverCompletedAccess(device,attempt,error){
+ if(!device||!['OUTCOME_UNKNOWN','INTERNAL_ERROR'].includes(error.code||'OUTCOME_UNKNOWN'))return false;
+ try{const r=await apiPost(API_URL,{action:'resumeDevice',device_id:device.device_id,credential_secret:device.credential_secret,include_bootstrap:true,user_agent:navigator.userAgent});return await adoptAccessResponse(r,attempt,device);}catch{return false;}
+}
+async function login(form){
+ const values=new FormData(form),phone=String(values.get('telefon')||'').trim(),code=String(values.get('codi')||'').trim(),attempt=beginAuthAttempt(),device=getOrCreateDevice();state.loginBusy=true;state.error='';const btn=form.querySelector('[type=submit]');btn.disabled=true;btn.textContent='Entrant…';
+ try{const r=await apiPost(API_URL,{action:'redeemInvite',telefon:phone,codi:code,include_bootstrap:true,...(device||{}),user_agent:navigator.userAgent});await adoptAccessResponse(r,attempt,device);}
+ catch(e){if(!await recoverCompletedAccess(device,attempt,e)&&isCurrentAuthAttempt(attempt))state.error=e.message;}
+ finally{if(isCurrentAuthAttempt(attempt)){state.loginBusy=false;render();}}
+}
+async function linkDevice(form){
+ const values=new FormData(form),attempt=beginAuthAttempt(),device=getOrCreateDevice();if(!device){state.error='Aquest navegador no permet recordar l’accés.';render();return;}state.loginBusy=true;state.error='';render();
+ try{const r=await apiPost(API_URL,{action:'redeemDeviceLink',telefon:String(values.get('telefon')||'').trim(),codi:String(values.get('codi')||'').trim(),include_bootstrap:true,...device,user_agent:navigator.userAgent});await adoptAccessResponse(r,attempt,device);}
+ catch(e){if(!await recoverCompletedAccess(device,attempt,e)&&isCurrentAuthAttempt(attempt))state.error=e.message;}
+ finally{if(isCurrentAuthAttempt(attempt)){state.loginBusy=false;render();}}
+}
+async function acceptPrivacy(form){
+ if(!new FormData(form).get('accepted')||!state.privacy)return;const attempt=beginAuthAttempt();state.loginBusy=true;state.error='';const version=state.privacy.version;
+ const payload=state.privacyRequest||{action:'acceptPrivacy',request_id:requestId(),accepted:true,version,include_bootstrap:true};state.privacyRequest=payload;render();
+ try{const r=await api(payload);if(!isCurrentAuthAttempt(attempt))return;const identity=sessionIdentity();if(!persistSession(identity,attempt.sharedSession,true)){resetSessionState();return;}attempt.sharedSession=storedValue(SESSION_KEY);attempt.allowMissing=false;attempt.adopted=identity;state.privacy=null;state.privacyRequest=null;if(r.bootstrap){if(!applyBootstrap(r.bootstrap,identity)){resetSessionState();return;}await ensureRememberedDevice(r.bootstrap,identity);}else await refresh(false);}
+ catch(e){if(isCurrentAuthAttempt(attempt))state.error=e.message;}
+ finally{if(isCurrentAuthAttempt(attempt)){state.loginBusy=false;render();}}
+}
+async function loadGallery(reset=false){
+  if(!state.verified||!navigator.onLine||state.galleryLoading||!state.galleryMatch)return;const selected=state.galleryMatch,hidden=state.includeHidden,token=state.session?.token;
+  state.galleryLoading=true;if(reset){state.viewGeneration++;state.gallery=[];state.galleryNext=null;}render();
+  try{const r=await api({action:'listPhotos',partit_id:selected,include_hidden:hidden,...(!reset&&state.galleryNext?{after:state.galleryNext}:{}),limit:30});if(state.galleryMatch!==selected||state.includeHidden!==hidden||state.session?.token!==token)return;if(reset){const current=new Set(r.fotos.map(f=>f.foto_id));state.galleryCacheIds.forEach(id=>{if(!current.has(id))forgetThumb(id);});state.galleryCacheIds=current;}else r.fotos.forEach(f=>state.galleryCacheIds.add(f.foto_id));state.gallery=reset?r.fotos:[...state.gallery,...r.fotos];state.galleryNext=r.nextCursor;}
+ catch(e){if(e.code!=='UNAUTHORIZED')toast(e.message);}
+ finally{state.galleryLoading=false;render();if(state.session?.token===token&&(state.galleryMatch!==selected||state.includeHidden!==hidden))await loadGallery(true);}
+ await loadThumbs();
+}
+function paintThumbs(){state.thumbs.forEach((url,id)=>{const img=document.querySelector(`[data-thumb="${CSS.escape(id)}"]`);if(img){img.src=url;img.hidden=false;}const spinner=document.querySelector(`[data-photo-spinner="${CSS.escape(id)}"]`);if(spinner)spinner.hidden=true;});}
+async function loadThumbs(){
+ const generation=state.viewGeneration,token=state.session?.token,hidden=state.includeHidden,ids=state.gallery.filter(f=>!state.thumbs.has(f.foto_id)).map(f=>f.foto_id);
+ const current=()=>!!token&&state.session?.token===token&&state.view==='photos'&&state.viewGeneration===generation&&navigator.onLine;
+ try{await mediaBatches(ids,async chunk=>{const r=await api({action:'getThumbnails',foto_ids:chunk,include_hidden:hidden});if(!current())return false;r.items.forEach(item=>{if(item.ok)state.thumbs.set(item.foto_id,imageUrl(item.base64));else{const img=document.querySelector(`[data-thumb="${CSS.escape(item.foto_id)}"]`);if(img){img.alt='Fotografia no disponible';img.hidden=false;}const spinner=document.querySelector(`[data-photo-spinner="${CSS.escape(item.foto_id)}"]`);if(spinner)spinner.hidden=true;}});paintThumbs();},current);}
+ catch(e){if(current())toast('Algunes miniatures no s’han carregat. Actualitza per tornar-ho a provar.');}
+}
+async function viewPhoto(id){
+ if(!state.verified||!navigator.onLine){toast('Necessites connexió per obrir fotografies.');return;}const f=state.gallery.find(f=>f.foto_id===id);if(!f)return;state.viewerPhoto=id;
+ modal.className='viewer';modal.innerHTML=`<header class="dialog-header"><h2 id="modal-title">${esc(f.peu||'Un instant de partit')}</h2>${actionBtn('close',icon('close'),'icon-btn','aria-label="Tancar fotografia"')}</header><div class="viewer-media"><span class="spinner"></span></div><div class="viewer-caption"><div><p>${esc(f.peu||'Un record de temporada')}</p><small>Compartida per ${esc(f.pujat_per_nom)}</small></div><div class="viewer-controls">${actionBtn('download-photo',icon('download')+' Descarregar','btn',`data-id="${esc(id)}"`)}${isAdmin()?`${actionBtn('visibility-photo',icon('eye')+(f.no_mostrar?' Mostrar':' Ocultar'),'btn',`data-id="${esc(id)}"`)}${actionBtn('delete-photo',icon('trash')+' Eliminar','btn danger',`data-id="${esc(id)}"`)}`:''}</div></div>`;if(!modal.open)modal.showModal();
+ try{const r=await api({action:'getPhoto',foto_id:id,include_hidden:state.includeHidden});if(state.viewerPhoto!==id||!modal.open)return;const media=modal.querySelector('.viewer-media'),img=document.createElement('img');state.viewerUrl=imageUrl(r.base64);img.src=state.viewerUrl;img.alt=f.peu||'Fotografia del partit';media.replaceChildren(img);}
+ catch(e){if(modal.open&&state.viewerPhoto===id)modal.querySelector('.viewer-media').textContent=e.message;}
+}
+function downloadConfirm(id){openModal('Un record per a casa',`<div class="info-callout">${icon('lock')}<p>Ús exclusivament privat i familiar. No publiquis aquesta fotografia a xarxes socials ni la comparteixis fora del grup sense autorització.</p></div><p class="hint">La petició de descàrrega quedarà registrada.</p>`,actionBtn('confirm-download','Acceptar i descarregar','btn',`data-id="${esc(id)}"`));}
+function blobDownload(blob,name){const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);}
+async function downloadPhoto(id,button){
+ const payload=state.pendingDownload?.foto_id===id?state.pendingDownload:{action:'downloadPhoto',request_id:requestId(),foto_id:id,private_use_ack:true,include_hidden:state.includeHidden};state.pendingDownload=payload;button.disabled=true;
+ try{const r=await api(payload);blobDownload(jpegBlob(r.base64),r.filename);state.pendingDownload=null;modal.close();toast('Descàrrega preparada. Només per a ús familiar.');}
+ catch(e){if(button.isConnected){button.disabled=false;toast(e.message);}}
+}
+async function photoVisibility(id){if(!isAdmin()||!canWrite())return;const f=state.gallery.find(f=>f.foto_id===id);if(!f)return;
+ const payload={action:f.no_mostrar?'showPhoto':'hidePhoto',request_id:requestId(),foto_id:id,motiu:f.no_mostrar?'':'Ocultada des de l’app'};
+ try{await api(payload);modal.close();await loadGallery(true);toast(f.no_mostrar?'Visibilitat actualitzada; les restriccions de jugador continuen aplicant-se.':'Fotografia ocultada.');}catch(e){toast(e.message);}
+}
+function deleteConfirm(id){openModal('Eliminar aquesta fotografia?',`<p>La fotografia i la miniatura s’eliminaran definitivament de Drive.</p><p class="hint" style="margin-top:14px">Aquesta acció no es pot desfer.</p>`,actionBtn('close','Cancel·lar','btn ghost')+actionBtn('confirm-delete','Eliminar definitivament','btn danger',`data-id="${esc(id)}"`));}
+async function deletePhoto(id,button){if(!isAdmin()||!canWrite())return;const payload=state.pendingDelete?.foto_id===id?state.pendingDelete:{action:'deletePhoto',request_id:requestId(),foto_id:id,confirm_permanent:true};state.pendingDelete=payload;button.disabled=true;
+ try{const r=await api(payload);if(r.pending){button.disabled=false;button.textContent='Reintentar l’eliminació';toast(r.message);return;}state.pendingDelete=null;modal.close();await loadGallery(true);toast('Fotografia eliminada.');}catch(e){if(button.isConnected)button.disabled=false;toast(e.message);}
+}
+function uploadDialog(){if(!canWrite()||!state.galleryMatch)return;state.queue=null;openModal('Compartir un tros de partit',`<form id="upload-form"><div class="upload-zone">${icon('upload')}<p>Tria les fotografies del partit</p><small>Les prepararem per al mòbil i les pujarem una a una.</small><label class="sr-only" for="upload-files">Fotografies</label><input id="upload-files" type="file" name="fotos" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,image/avif" multiple required></div><div class="form-field"><label for="photo-caption">Peu de foto opcional</label><input id="photo-caption" name="peu" class="input" maxlength="250" placeholder="Un gran matí de futbol"><p class="hint">S’aplicarà a les fotos seleccionades. Evita cognoms.</p></div>${(state.data.jugadors||[]).length?`<fieldset style="border:0;padding:0;margin-top:22px"><legend class="hint">Qui hi apareix? Etiqueta tots els jugadors identificables.</legend><div class="player-tags">${state.data.jugadors.map(j=>`<label class="player-tag"><input type="checkbox" name="jugadors" value="${esc(j.jugador_id)}">${esc(j.nom)}${j.no_mostrar?' · no mostrar':''}</label>`).join('')}</div></fieldset>`:''}<label class="check-line no-player-check"><input id="photo-no-players" type="checkbox" name="sense_jugadors"> Cap jugador identificable</label><div class="info-callout">${icon('lock')}<p>Comprova que aquestes fotos es poden compartir amb el grup. Cal etiquetar els jugadors o confirmar que no n’hi ha cap d’identificable.</p></div><button type="submit" class="btn full" disabled>Pujar les fotografies</button></form>`);}
+function updateUploadChoice(form,target){const none=form.elements.sense_jugadors,players=[...form.querySelectorAll('[name=jugadors]')];if(target===none&&none.checked)players.forEach(input=>{input.checked=false;input.disabled=true;});else if(target?.name==='jugadors'&&target.checked){none.checked=false;players.forEach(input=>input.disabled=false);}else if(!none.checked)players.forEach(input=>input.disabled=false);form.querySelector('[type=submit]').disabled=!none.checked&&!players.some(input=>input.checked);}
+async function beginUpload(form){
+ if(!canWrite())return;const files=[...form.querySelector('[type=file]').files];if(!files.length)return;
+ if(files.length>40){toast('Tria com a màxim 40 fotografies per tanda.');return;}
+ const players=[...form.querySelectorAll('[name=jugadors]:checked')].map(e=>e.value),withoutPlayers=form.elements.sense_jugadors.checked;if(!players.length&&!withoutPlayers){toast('Etiqueta els jugadors o marca «Cap jugador identificable».');return;}
+ state.queue={partit_id:state.galleryMatch,jugadors_ids:players,sense_jugadors:withoutPlayers,peu:form.elements.peu.value,items:files.map(file=>({file,name:file.name,status:'pending',prepared:null,error:''}))};await uploadQueue();
+}
+function queueDialog(){
+ const q=state.queue;if(!q)return;const done=q.items.filter(i=>i.status==='done').length;
+ openModal('Records de partit',`<p>${done} de ${q.items.length} fotografies pujades</p><div class="progress" aria-label="Progrés de la pujada"><span style="width:${Math.round(done/q.items.length*100)}%"></span></div><div class="queue-list">${q.items.map(i=>`<div class="queue-item ${i.status}"><span>${esc(i.name)}</span><span class="status">${i.status==='done'?'Pujada ✓':i.status==='uploading'?'Pujant…':i.status==='failed'?'Ha fallat':'Pendent'}</span></div>`).join('')}</div>${q.items.some(i=>i.error)?`<p class="error-msg" role="alert">${esc(q.items.find(i=>i.error).error)}</p>`:''}`,
+ state.uploading?'<p class="hint">Pujant una fotografia cada vegada…</p>':done===q.items.length?actionBtn('close','Tornar a la galeria','btn'):actionBtn('retry-uploads','Reintentar i continuar','btn')+actionBtn('close','Tancar','btn ghost'));
+ const close=modal.querySelector('[data-action=close]');if(close)close.disabled=state.uploading;
+}
+async function uploadQueue(){
+ if(!state.queue||state.uploading||!state.verified||!navigator.onLine)return;const identity=sessionIdentity(),q=state.queue,config=galleryUploadConfig(state.data.config);state.uploading=true;queueDialog();
+ for(const item of q.items){if(!isCurrentSession(identity))return;if(item.status==='done')continue;if(!navigator.onLine){item.status='failed';item.error='S’ha perdut la connexió. Les fotos anteriors ja estan guardades.';break;}
+  item.status='uploading';item.error='';queueDialog();
+  try{const prepared=item.prepared||await prepareUpload(item.file,{partit_id:q.partit_id,jugadors_ids:q.jugadors_ids,sense_jugadors:q.sense_jugadors,peu:q.peu,config});if(!isCurrentSession(identity))return;item.prepared=prepared;await api(prepared);if(!isCurrentSession(identity))return;item.status='done';item.prepared=null;}
+  catch(e){if(!isCurrentSession(identity))return;item.status='failed';item.error=e.message;if(['VALIDATION','FORBIDDEN','PRIVACY_REQUIRED'].includes(e.code))item.prepared=null;break;}
+ }
+ if(isCurrentSession(identity)){state.uploading=false;queueDialog();await loadGallery(true);}
+}
+async function navigate(view){if(!['home','calendar','photos','team','league',...(isAdmin()?['families']:[])].includes(view))return;if(view==='team'&&playerEditNoticeEligible())markPlayerEditNoticeSeen();if(['photos','team'].includes(state.view)&&view!==state.view){state.viewGeneration++;state.portraitLoads.clear();if(state.view==='photos'){state.gallery=[];state.galleryNext=null;}if(state.view==='team'&&state.portraits.size)state.portraitsVerified=false;}if(state.view==='families'&&view!=='families')state.users=[];state.view=view;state.error='';render();window.scrollTo({top:0,behavior:'instant'});if(view==='photos')await loadGallery(true);if(view==='team'&&state.portraits.size&&!state.portraitsVerified)await refresh(false);if(view==='families')await loadUsers();}
+function account(){const roleNames={familia:'Família',editor:'Editor',admin:'Administrador'},link=state.data?.features?.device_linking===true?actionBtn('connect-device',icon('phone')+' Connectar un altre dispositiu','btn secondary',canWrite()?'':'disabled'):'';openModal('El teu espai',`<div class="account-summary"><div class="avatar">${esc(initials(user().nom))}</div><div><h3>${esc(user().nom)}</h3><p>${esc(roleNames[user().rol]||'Família')}</p></div></div><div class="account-links">${link}${actionBtn('install',icon('phone')+' Afegir l’app al mòbil','btn secondary')}${actionBtn('about',icon('info')+' Sobre aquesta app','btn ghost')}${actionBtn('logout',icon('logout')+' Tancar sessió en aquest dispositiu','btn ghost',state.uploading?'disabled':'')}</div><p class="hint" style="margin-top:25px">Versió ${APP_VERSION} · Aquest dispositiu recordarà el teu accés fins que tanquis sessió.</p>`);}
+async function createDeviceLink(){
+ if(!state.data?.features?.device_linking||!canWrite())return;
+ try{const r=await api({action:'createDeviceLink',request_id:requestId()});openModal('Connectar un altre dispositiu',`<div class="invite-result"><p class="eyebrow">Codi temporal</p><strong>${esc(r.codi)}</strong><p>Al navegador nou, prem «Ja tinc accés en un altre dispositiu» i escriu aquest codi. Caduca en 10 minuts i només es pot utilitzar una vegada.</p></div><p class="hint" style="margin-top:16px">No enviïs aquest codi fora de la teva família.</p>`);}
+ catch(e){toast(e.message);}
+}
+function about(){openModal('Futbol, família i poble',`<div class="credits"><p>Aquesta és l’app privada de les famílies del CF Vilajuïga. Calendari, resultats i records de la temporada.</p><p><strong>Privacitat</strong><br>Les fotografies són d’ús familiar. No les publiquis ni les comparteixis fora del grup sense autorització.</p><p><strong>Sense connexió</strong><br>Pots consultar les últimes dades guardades de la temporada mentre la sessió sigui vigent. Les fotos i les edicions necessiten connexió.</p><p><strong>Imatges del disseny</strong><br>Foto ambiental: <a href="https://unsplash.com/photos/soccer-ball-rests-in-the-grass-at-sunset-GTxVeJj1UU0" target="_blank" rel="noopener noreferrer">Nikola Tomašić · Unsplash</a>. No és una fotografia del camp de Vilajuïga.<br>Escut publicat a <a href="https://futbol-regional.es/equipo.php?equ=15064" target="_blank" rel="noopener noreferrer">Fútbol Regional Español</a>; pendent de confirmar amb el club que aquesta és la versió actual. La icona de l’app és un monograma propi.</p><p>Tipografia Barlow Condensed: Jeremy Tribby, SIL Open Font License. Versió ${APP_VERSION}.</p></div>`);}
+async function install(){
+ if(state.installEvent){const e=state.installEvent;state.installEvent=null;await e.prompt();return;}
+ openModal('Sempre a mà',`<div class="info-callout">${icon('phone')}<p>Des d’Android: obre el menú del navegador i tria «Instal·lar app» o «Afegir a la pantalla d’inici».<br><br>Des d’iPhone: obre l’app amb Safari, toca «Compartir» i «Afegir a la pantalla d’inici».</p></div><p class="hint">Si el navegador encara no ofereix instal·lació, podràs continuar fent servir l’app des de l’enllaç.</p>`);
+}
+async function logout(){if(state.uploading)return;const session=state.session;authAttemptGeneration++;clearLocal(true);state.pendingEdit=null;state.pendingDownload=null;state.pendingDelete=null;state.privacyRequest=null;state.error='';render();if(session&&navigator.onLine){try{await apiPost(API_URL,{action:'logout',token:session.token,request_id:requestId(),user_agent:navigator.userAgent});}catch{toast('Accés esborrat d’aquest navegador. No s’ha pogut confirmar el tancament al servidor.');}}}
+async function action(target){
+ const a=target.dataset.action,id=target.dataset.id;
+ if(a==='close'){if(!state.uploading)modal.close();return;}
+ if(a==='dismiss-player-edit-notice'){markPlayerEditNoticeSeen();render();return;}
+ if(a==='open-player-cards')return navigate('team');
+ if(a==='navigate')return navigate(target.dataset.view);
+ if(a==='filter'){state.filter=target.dataset.filter;render();return;}
+ if(a==='refresh')return refresh();
+ if(a==='match')return matchDetails(id);
+ if(a==='club')return clubDetails(id);
+ if(a==='player')return playerDetails(id);
+ if(a==='edit-player')return playerEditor(id);
+ if(a==='add-player')return playerEditor();
+ if(a==='reload-player'){state.playerDraft=null;modal.close();await refresh(false);if(canEditPlayer(id))return playerEditor(id);toast('Aquest cromo ja no està disponible per editar.');return;}
+ if(a==='edit-portrait')return editPlayerPortrait(target.closest('#player-form'));
+ if(a==='rotate-portrait-left'){state.playerPortraitEditor?.rotate(-90);return;}
+ if(a==='rotate-portrait-right'){state.playerPortraitEditor?.rotate(90);return;}
+ if(a==='reset-portrait'){state.playerPortraitEditor?.reset();return;}
+ if(a==='cancel-portrait'){cancelPlayerPortrait(target.closest('#player-form'));return;}
+ if(a==='apply-portrait')return applyPlayerPortrait(target.closest('#player-form'));
+ if(a==='match-gallery'){modal.close();state.galleryMatch=id;return navigate('photos');}
+ if(a==='edit-match')return editor(id);
+ if(a==='edit-tab')return editor(state.modalMatch,target.dataset.mode);
+ if(a==='add-user')return userEditor();
+ if(a==='edit-user')return userEditor(id);
+ if(a==='invite-user')return createInvite(id);
+ if(a==='revoke-user')return confirmUserAction('revoke',id);
+ if(a==='toggle-user')return confirmUserAction('toggle',id);
+ if(a==='confirm-user')return changeUser(target.dataset.mode,id);
+ if(a==='copy-invite')return copyInvite();
+ if(a==='upload')return uploadDialog();
+ if(a==='retry-uploads')return uploadQueue();
+ if(a==='more-photos')return loadGallery(false);
+ if(a==='photo')return viewPhoto(id);
+ if(a==='download-photo')return downloadConfirm(id);
+ if(a==='confirm-download')return downloadPhoto(id,target);
+ if(a==='visibility-photo')return photoVisibility(id);
+ if(a==='delete-photo')return deleteConfirm(id);
+ if(a==='confirm-delete')return deletePhoto(id,target);
+ if(a==='account')return account();
+ if(a==='about')return about();
+  if(a==='install')return install();
+  if(a==='connect-device')return createDeviceLink();
+  if(a==='use-device-link'&&state.publicFeatures.device_linking){state.linkLogin=true;state.error='';render();return;}
+  if(a==='use-invite'){state.linkLogin=false;state.error='';render();return;}
+ if(a==='logout')return logout();
+ if(a==='add-calendar'){const m=matches().find(m=>m.partit_id===id),ics=m&&icsForMatch(m);if(ics)blobDownload(new Blob([ics],{type:'text/calendar;charset=utf-8'}),'CF-Vilajuiga-'+id+'.ics');}
+}
+document.addEventListener('click',e=>{const target=e.target.closest('[data-action]');if(!target||target.disabled)return;action(target).catch(err=>toast(err.message));});
+document.addEventListener('submit',e=>{const form=e.target;const handler={'login-form':login,'device-link-form':linkDevice,'privacy-form':acceptPrivacy,'edit-form':saveEdit,'upload-form':beginUpload,'player-form':savePlayer,'user-form':saveUser}[form.id];if(handler){e.preventDefault();handler(form).catch(err=>toast(err.message));}});
+document.addEventListener('input',e=>{if(e.target.closest('#player-form'))updatePlayerPreview(e.target.closest('#player-form'));});
+document.addEventListener('change',e=>{const playerForm=e.target.closest('#player-form');if(playerForm){if(e.target.name==='retrat')selectPlayerPortrait(playerForm,e.target.files[0]).catch(err=>setPortraitStatus(err.message,true));else updatePlayerPreview(playerForm);}if(e.target.closest('#upload-form')&&(e.target.name==='jugadors'||e.target.name==='sense_jugadors'))updateUploadChoice(e.target.closest('#upload-form'),e.target);if(e.target.id==='gallery-match'){state.galleryMatch=e.target.value;loadGallery(true);}if(e.target.id==='hidden-photos'){state.includeHidden=e.target.checked;loadGallery(true);}if(e.target.id==='match-status'){const played=e.target.value==='jugat';['gols-local','gols-visitant'].forEach(id=>{const input=$(id);input.disabled=!played;input.required=played;});}});
+modal.addEventListener('cancel',e=>{if(state.uploading)e.preventDefault();});
+modal.addEventListener('close',()=>{state.viewerPhoto=null;releaseImage(state.viewerUrl);state.viewerUrl=null;disposePlayerPortrait();state.queue=state.uploading?state.queue:null;modal.className='';modal.replaceChildren();});
+window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();state.installEvent=e;});
+window.addEventListener('offline',()=>{state.verified=false;forgetImages();state.gallery=[];if(modal.open&&!state.uploading)modal.close();render();});
+window.addEventListener('online',()=>refresh());
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&state.session&&!state.privacy&&!state.uploading)refresh(false);});
+window.addEventListener('storage',e=>{
+ if(e.storageArea!==localStorage||![SESSION_KEY,DEVICE_KEY].includes(e.key)||e.newValue!==storedValue(e.key))return;
+ if(e.key===DEVICE_KEY){const incoming=validDevice(parseStored(e.newValue));deviceGeneration++;authAttemptGeneration++;if(incoming&&state.device?.device_id===incoming.device_id){state.device=incoming;return;}state.device=incoming;if(state.session){clearTechnicalSession();state.device=incoming;}render();if(canResumeDevice(incoming)&&!state.session)resumeRemembered();return;}
+ const incoming=parseStored(e.newValue),current=state.session;if(current&&usableSession(incoming)&&incoming.cacheKey===current.cacheKey){state.session=incoming;return;}if(current?.cacheKey)remove(PREFIX+'data:'+current.cacheKey);resetSessionState();state.device=rememberedDevice();state.error=canResumeDevice(state.device)?'Renovant l’accés recordat…':e.newValue===null?'La sessió s’ha tancat en una altra pestanya.':'La sessió ha canviat en una altra pestanya.';render();if(canResumeDevice(state.device))resumeRemembered();
+});
+window.addEventListener('beforeunload',e=>{if(state.uploading){e.preventDefault();e.returnValue='';}});
+setInterval(()=>{if(state.session&&!usableSession(state.session)){clearTechnicalSession();state.error=canResumeDevice(state.device)?'Renovant l’accés recordat…':'La sessió ha caducat. Torna a entrar.';render();if(canResumeDevice(state.device))resumeRemembered();}},30000);
+if('serviceWorker' in navigator)navigator.serviceWorker.register('./sw.js').catch(()=>{});
+render();(async()=>{await loadPublicFeatures();if(state.session&&!state.privacy)refresh(false);else if(state.publicFeatures.device_linking&&validDevice(state.device))resumeRemembered();})();
